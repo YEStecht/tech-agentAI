@@ -3,3 +3,5 @@ openai
 streamlit
 requests
 beautifulsoup4
+python-docx
+python-pptx
