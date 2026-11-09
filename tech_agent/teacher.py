@@ -170,9 +170,102 @@ if menu == "실습 관리":
 
     st.caption("현재 단계에서는 실습 자체 삭제와 공개 전환을 지원하지 않습니다. 안전 체크리스트 승인 기능을 구현한 뒤 추가할 예정입니다.")
 
+
 elif menu == "AI 생성 자료 검토":
-    st.subheader("✅ AI 생성 자료 검토")
-    st.info("다음 단계에서 실습별 제작 단계와 안전 체크리스트 초안을 생성하고 교사가 검토·승인하는 기능을 구현합니다.")
+    from stage_generator import generate_stage_draft
+
+    st.subheader("🤖 AI 제작 단계 초안 생성")
+    st.write(
+        "등록된 실습 자료를 바탕으로 AI가 제작 단계 초안을 작성합니다. "
+        "교사가 내용을 검토하고 수정할 수 있습니다."
+    )
+
+    practices = list_practices()
+
+    if not practices:
+        st.info("먼저 '실습 관리'에서 실습을 등록해 주세요.")
+    else:
+        options = {
+            p["id"]: f"#{p['id']} · {p['title']}"
+            for p in practices
+        }
+
+        selected_id = st.selectbox(
+            "제작 단계를 생성할 실습",
+            options=list(options),
+            format_func=lambda pid: options[pid],
+            key="stage_practice_select",
+        )
+
+        practice = get_practice(selected_id)
+        files = list_practice_files(selected_id)
+
+        if practice:
+            st.caption(
+                f"등록된 자료: {len(files)}개 · "
+                f"공개 상태: {'공개' if practice['is_published'] else '비공개'}"
+            )
+
+            if not practice["vector_store_id"]:
+                st.warning(
+                    "이 실습에는 RAG 자료가 없습니다. "
+                    "'실습 관리'에서 자료를 먼저 업로드해 주세요."
+                )
+            else:
+                if st.button(
+                    "✨ AI 제작 단계 초안 생성",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        with st.spinner(
+                            "실습 자료를 검색하고 제작 단계를 작성하는 중..."
+                        ):
+                            draft = generate_stage_draft(selected_id)
+
+                        st.session_state["stage_draft"] = draft
+                        st.session_state["stage_draft_practice"] = selected_id
+                        st.success("제작 단계 초안이 생성됐어요!")
+
+                    except Exception as exc:
+                        st.error("AI 초안 생성에 실패했습니다.")
+                        st.caption(f"오류 내용: {exc}")
+
+            if (
+                st.session_state.get("stage_draft_practice")
+                == selected_id
+                and st.session_state.get("stage_draft")
+            ):
+                st.divider()
+                st.subheader("📝 제작 단계 초안 검토")
+
+                st.info(
+                    "AI가 작성한 초안입니다. "
+                    "원본 실습 자료와 비교해 정확성을 확인해 주세요."
+                )
+
+                edited_draft = st.text_area(
+                    "제작 단계 내용",
+                    value=st.session_state["stage_draft"],
+                    height=400,
+                    key=f"stage_editor_{selected_id}",
+                )
+
+                st.caption(
+                    "현재는 초안 생성과 화면에서의 수정만 지원합니다. "
+                    "데이터베이스 저장 및 교사 승인은 다음 단계에서 추가합니다."
+                )
+
+                if st.button("수정 내용 임시 반영"):
+                    st.session_state["stage_draft"] = edited_draft
+                    st.success(
+                        "현재 화면의 초안에 반영했습니다. "
+                        "영구 저장된 것은 아닙니다."
+                    )
+
 else:
     st.subheader("📊 익명 통계")
-    st.info("다음 단계에서 실습 단계별·질문 유형별 익명 통계를 구현합니다.")
+    st.info(
+        "다음 단계에서 실습 단계별·질문 유형별 "
+        "익명 통계를 구현합니다."
+    )
