@@ -12,6 +12,7 @@ from knowledge_service import (
     create_vector_store, upload_and_index, delete_indexed_file,
     SUPPORTED_EXTENSIONS, MAX_FILE_BYTES,
 )
+from publication_ui import render_publication_controls
 
 st.set_page_config(page_title="기술 제작 실습 · 교사 관리", page_icon="🔐", layout="wide")
 init_db()
@@ -78,6 +79,7 @@ if menu == "실습 관리":
         st.stop()
 
     st.caption("🔒 비공개" if not practice["is_published"] else "🟢 공개 상태")
+    render_publication_controls(selected_id)
     with st.expander("✏️ 실습 정보 수정"):
         with st.form(f"edit_{selected_id}"):
             edited_title = st.text_input("실습명", value=practice["title"])
@@ -174,8 +176,13 @@ if menu == "실습 관리":
 
 elif menu == "AI 생성 자료 검토":
     from stage_ui import render_stage_editor
+    from safety_ui import render_safety_editor
 
-    render_stage_editor()
+    stage_tab, safety_tab = st.tabs(["제작 단계", "안전 체크리스트"])
+    with stage_tab:
+        render_stage_editor()
+    with safety_tab:
+        render_safety_editor()
 
 else:
     st.subheader("📊 익명 통계")

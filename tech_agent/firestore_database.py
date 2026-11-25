@@ -7,6 +7,10 @@ from firebase_admin import firestore
 import sqlite_database
 from firebase_client import get_firestore_client
 from stage_editor import StagePlanConflictError, cleaned_stages, validate_stages
+from safety_editor import (
+    SafetyChecklistConflictError, cleaned_items, validate_items,
+)
+from publication import publication_requirements, require_publishable
 
 PRACTICES = "practices"
 PRACTICE_FILES = "practice_files"
@@ -17,6 +21,9 @@ __all__ = [
     "update_practice", "set_vector_store", "list_practice_files", "delete_practice",
     "add_practice_file", "get_practice_file", "remove_practice_file",
     "get_stage_plan", "save_stage_plan",
+    "get_safety_checklist", "save_safety_checklist",
+    "get_publish_requirements", "set_practice_published",
+    "list_published_practices", "get_student_practice_data",
 ]
 
 
@@ -112,6 +119,14 @@ def create_practice(title, description=""):
 
 def list_practices():
     records = [_record(item) for item in get_firestore_client().collection(PRACTICES).stream()]
+    return sorted((item for item in records if item), key=lambda item: item["id"], reverse=True)
+
+
+def list_published_practices():
+    snapshots = get_firestore_client().collection(PRACTICES).where(
+        "is_published", "==", True
+    ).stream()
+    records = [_record(item) for item in snapshots]
     return sorted((item for item in records if item), key=lambda item: item["id"], reverse=True)
 
 
@@ -259,6 +274,121 @@ def save_stage_plan(practice_id, stages, expected_version=None):
             },
         )
         return version
+
+    return _run_transaction(client, operation)
+
+
+def _safety_checklist_ref(client, practice_id):
+    return (
+        client.collection(PRACTICES)
+        .document(str(practice_id))
+        .collection("safety_checklists")
+        .document("current")
+    )
+
+
+def get_safety_checklist(practice_id):
+    snapshot = _safety_checklist_ref(get_firestore_client(), practice_id).get()
+    if not snapshot.exists:
+        return None
+    value = snapshot.to_dict()
+    return {
+        "practice_id": int(practice_id),
+        "items": value["items"],
+        "version": int(value["version"]),
+        "updated_at": _created_at(value.get("updated_at")),
+    }
+
+
+def get_student_practice_data(practice_id):
+    client = get_firestore_client()
+    practice = _record(client.collection(PRACTICES).document(str(practice_id)).get())
+    if not practice or not practice.get("is_published"):
+        return None
+    stage_plan = get_stage_plan(practice_id)
+    safety_checklist = get_safety_checklist(practice_id)
+    if not stage_plan or not safety_checklist or not practice.get("vector_store_id"):
+        return None
+    return {
+        "practice": practice,
+        "stages": stage_plan["stages"],
+        "safety_items": safety_checklist["items"],
+        "vector_store_id": practice["vector_store_id"],
+    }
+
+
+def save_safety_checklist(practice_id, items, expected_version=None):
+    errors = validate_items(items)
+    if errors:
+        raise ValueError(" ".join(errors))
+    normalized = cleaned_items(items)
+    client = get_firestore_client()
+    reference = _safety_checklist_ref(client, practice_id)
+
+    def operation(transaction):
+        snapshot = reference.get(transaction=transaction)
+        if not snapshot.exists:
+            if expected_version is not None:
+                raise SafetyChecklistConflictError("저장된 안전 체크리스트가 변경되었습니다.")
+            version = 1
+        else:
+            current_version = int(snapshot.to_dict()["version"])
+            if expected_version != current_version:
+                raise SafetyChecklistConflictError("다른 교사가 먼저 안전 체크리스트를 저장했습니다.")
+            version = current_version + 1
+        transaction.set(
+            reference,
+            {
+                "schema_version": 1,
+                "items": normalized,
+                "version": version,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+        )
+        return version
+
+    return _run_transaction(client, operation)
+
+
+def _publish_requirements(client, practice_id, transaction=None):
+    practice_ref = client.collection(PRACTICES).document(str(practice_id))
+    practice_snapshot = practice_ref.get(transaction=transaction)
+    if not practice_snapshot.exists:
+        raise ValueError("실습을 찾을 수 없습니다.")
+    files = [
+        snapshot.to_dict()
+        for snapshot in client.collection(PRACTICE_FILES)
+        .where("practice_id", "==", int(practice_id))
+        .stream(transaction=transaction)
+    ]
+    stage_snapshot = _stage_plan_ref(client, practice_id).get(transaction=transaction)
+    safety_snapshot = _safety_checklist_ref(client, practice_id).get(transaction=transaction)
+    return publication_requirements(
+        practice_snapshot.to_dict(), files,
+        stage_snapshot.to_dict() if stage_snapshot.exists else None,
+        safety_snapshot.to_dict() if safety_snapshot.exists else None,
+    )
+
+
+def get_publish_requirements(practice_id):
+    return _publish_requirements(get_firestore_client(), practice_id)
+
+
+def set_practice_published(practice_id, published):
+    client = get_firestore_client()
+    reference = client.collection(PRACTICES).document(str(practice_id))
+
+    def operation(transaction):
+        if published:
+            require_publishable(_publish_requirements(client, practice_id, transaction))
+        elif not reference.get(transaction=transaction).exists:
+            raise ValueError("실습을 찾을 수 없습니다.")
+        transaction.set(
+            reference,
+            {"is_published": bool(published), "updated_at": firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
+        return True
 
     return _run_transaction(client, operation)
 

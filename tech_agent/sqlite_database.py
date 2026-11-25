@@ -7,6 +7,10 @@ from contextlib import closing
 from pathlib import Path
 
 from stage_editor import StagePlanConflictError, cleaned_stages, validate_stages
+from safety_editor import (
+    SafetyChecklistConflictError, cleaned_items, validate_items,
+)
+from publication import publication_requirements, require_publishable
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("PRACTICE_DB_PATH", str(BASE_DIR / "practice_data.db")))
@@ -15,6 +19,9 @@ __all__ = [
     "update_practice", "set_vector_store", "list_practice_files", "delete_practice",
     "add_practice_file", "get_practice_file", "remove_practice_file",
     "get_stage_plan", "save_stage_plan",
+    "get_safety_checklist", "save_safety_checklist",
+    "get_publish_requirements", "set_practice_published",
+    "list_published_practices", "get_student_practice_data",
 ]
 
 
@@ -85,6 +92,15 @@ def init_db():
                 FOREIGN KEY (practice_id) REFERENCES practices(id) ON DELETE CASCADE
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS practice_safety_checklists (
+                practice_id INTEGER PRIMARY KEY,
+                items_json TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (practice_id) REFERENCES practices(id) ON DELETE CASCADE
+            )
+        """)
 
 
 def create_practice(title, description=""):
@@ -102,6 +118,14 @@ def create_practice(title, description=""):
 def list_practices():
     with closing(get_connection()) as conn, conn:
         rows = conn.execute("SELECT * FROM practices ORDER BY id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+
+def list_published_practices():
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM practices WHERE is_published = 1 ORDER BY id DESC"
+        ).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -221,3 +245,120 @@ def save_stage_plan(practice_id, stages, expected_version=None):
                 (json.dumps(normalized, ensure_ascii=False), version, practice_id),
             )
     return version
+
+
+def get_safety_checklist(practice_id):
+    with closing(get_connection()) as conn, conn:
+        row = conn.execute(
+            "SELECT * FROM practice_safety_checklists WHERE practice_id = ?",
+            (practice_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "practice_id": int(row["practice_id"]),
+            "items": json.loads(row["items_json"]),
+            "version": int(row["version"]),
+            "updated_at": row["updated_at"],
+        }
+
+
+def get_student_practice_data(practice_id):
+    with closing(get_connection()) as conn:
+        practice = conn.execute(
+            "SELECT * FROM practices WHERE id = ? AND is_published = 1", (practice_id,)
+        ).fetchone()
+        if not practice or not practice["vector_store_id"]:
+            return None
+        stage_plan = conn.execute(
+            "SELECT stages_json FROM practice_stage_plans WHERE practice_id = ?", (practice_id,)
+        ).fetchone()
+        safety_checklist = conn.execute(
+            "SELECT items_json FROM practice_safety_checklists WHERE practice_id = ?",
+            (practice_id,),
+        ).fetchone()
+        if not stage_plan or not safety_checklist:
+            return None
+        return {
+            "practice": dict(practice),
+            "stages": json.loads(stage_plan["stages_json"]),
+            "safety_items": json.loads(safety_checklist["items_json"]),
+            "vector_store_id": practice["vector_store_id"],
+        }
+
+
+def save_safety_checklist(practice_id, items, expected_version=None):
+    errors = validate_items(items)
+    if errors:
+        raise ValueError(" ".join(errors))
+    normalized = cleaned_items(items)
+    with closing(get_connection()) as conn, conn:
+        row = conn.execute(
+            "SELECT version FROM practice_safety_checklists WHERE practice_id = ?",
+            (practice_id,),
+        ).fetchone()
+        if row is None:
+            if expected_version is not None:
+                raise SafetyChecklistConflictError("저장된 안전 체크리스트가 변경되었습니다.")
+            version = 1
+            conn.execute(
+                """
+                INSERT INTO practice_safety_checklists (practice_id, items_json, version)
+                VALUES (?, ?, ?)
+                """,
+                (practice_id, json.dumps(normalized, ensure_ascii=False), version),
+            )
+        else:
+            current_version = int(row["version"])
+            if expected_version != current_version:
+                raise SafetyChecklistConflictError("다른 교사가 먼저 안전 체크리스트를 저장했습니다.")
+            version = current_version + 1
+            conn.execute(
+                """
+                UPDATE practice_safety_checklists
+                SET items_json = ?, version = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE practice_id = ?
+                """,
+                (json.dumps(normalized, ensure_ascii=False), version, practice_id),
+            )
+    return version
+
+
+def _publish_requirements(conn, practice_id):
+    practice = conn.execute(
+        "SELECT * FROM practices WHERE id = ?", (practice_id,)
+    ).fetchone()
+    if not practice:
+        raise ValueError("실습을 찾을 수 없습니다.")
+    files = conn.execute(
+        "SELECT * FROM practice_files WHERE practice_id = ?", (practice_id,)
+    ).fetchall()
+    stage_plan = conn.execute(
+        "SELECT 1 FROM practice_stage_plans WHERE practice_id = ?", (practice_id,)
+    ).fetchone()
+    safety_checklist = conn.execute(
+        "SELECT 1 FROM practice_safety_checklists WHERE practice_id = ?", (practice_id,)
+    ).fetchone()
+    return publication_requirements(
+        dict(practice), [dict(item) for item in files], stage_plan, safety_checklist
+    )
+
+
+def get_publish_requirements(practice_id):
+    with closing(get_connection()) as conn:
+        return _publish_requirements(conn, practice_id)
+
+
+def set_practice_published(practice_id, published):
+    with closing(get_connection()) as conn, conn:
+        if published:
+            require_publishable(_publish_requirements(conn, practice_id))
+        elif not conn.execute(
+            "SELECT 1 FROM practices WHERE id = ?", (practice_id,)
+        ).fetchone():
+            raise ValueError("실습을 찾을 수 없습니다.")
+        conn.execute(
+            "UPDATE practices SET is_published = ? WHERE id = ?",
+            (int(bool(published)), practice_id),
+        )
+        return True

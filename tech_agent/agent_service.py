@@ -50,9 +50,8 @@ def get_setting(name: str) -> str:
     return os.getenv(name, "")
 
 
-def create_agent():
+def create_agent(vector_store_id: str):
     api_key = get_setting("OPENAI_API_KEY")
-    vector_store_id = get_setting("VECTOR_STORE_ID")
     if not api_key or not vector_store_id:
         raise ValueError("AI 서비스 설정이 완료되지 않았습니다.")
     set_default_openai_key(api_key)
