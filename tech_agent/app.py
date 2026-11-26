@@ -8,6 +8,7 @@ from agents import SQLiteSession
 
 from agent_service import ask_agent, create_agent
 from database import get_student_practice_data, list_published_practices
+from image_service import prepare_image
 from safety_agent_service import (
     create_safety_agent, evaluate_safety_answer, generate_safety_questions,
 )
@@ -265,17 +266,45 @@ with st.sidebar:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message.get("has_image"):
+            st.caption("📷 사진 첨부됨 (원본은 저장하지 않음)")
 
-question = st.chat_input("제작 과정에서 어떤 점이 어려운가요?")
-if question:
-    st.session_state.messages.append({"role": "user", "content": question})
+st.caption("얼굴, 이름표 등 개인정보가 보이지 않는 제작물 사진만 첨부해 주세요. 원본 사진은 저장하지 않아요.")
+submission = st.chat_input(
+    "어려운 점을 쓰거나 제작물 사진을 첨부해 주세요.",
+    accept_file=True,
+    file_type=["jpg", "jpeg", "png"],
+    max_upload_size=5,
+    key=f"diagnosis_chat_input_{practice_id}",
+)
+if submission:
+    question = submission if isinstance(submission, str) else submission.text
+    files = [] if isinstance(submission, str) else submission.files
+    uploaded_image = files[0] if files else None
+    image = None
+    image_mime_type = None
+    if uploaded_image:
+        try:
+            image, image_mime_type = prepare_image(uploaded_image.getvalue())
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+    if not question.strip() and not image:
+        st.stop()
+    display_question = question.strip() or "이 사진에서 확인할 점을 알고 싶어요."
+    st.session_state.messages.append({
+        "role": "user", "content": display_question, "has_image": bool(image),
+    })
     with st.chat_message("user"):
-        st.markdown(question)
+        st.markdown(display_question)
+        if image:
+            st.image(image, caption="첨부한 제작물 사진", width="stretch")
     with st.chat_message("assistant"):
         with st.spinner("실습 자료를 확인하고 있어요..."):
             try:
                 answer = ask_agent(
-                    agent, question, current_stage, st.session_state.agent_session
+                    agent, display_question, current_stage, st.session_state.agent_session,
+                    image, image_mime_type,
                 )
             except Exception:
                 logger.exception("학생 AI 응답 처리 실패")

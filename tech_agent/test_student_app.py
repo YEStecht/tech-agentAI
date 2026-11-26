@@ -1,13 +1,23 @@
 """Student practice selection and agent wiring tests."""
 
+import asyncio
+import tempfile
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from PIL import Image
 from streamlit.testing.v1 import AppTest
 
 import agent_service
 import safety_agent_service
+
+
+def test_image_bytes():
+    output = BytesIO()
+    Image.new("RGB", (16, 16), "white").save(output, format="JPEG")
+    return output.getvalue()
 
 
 APP_SOURCE = r'''
@@ -56,8 +66,13 @@ database.list_published_practices = list_published
 database.get_student_practice_data = get_student_data
 agents.SQLiteSession = FakeSession
 agent_service.create_agent = lambda vector_store_id: st.session_state.__setitem__("test_vector_store", vector_store_id) or object()
-def ask_agent(agent, question, stage, session):
-    st.session_state.test_agent_call = {"question": question, "stage": stage, "session": session}
+def ask_agent(agent, question, stage, session, image=None, image_mime_type=None):
+    st.session_state.test_agent_call = {
+        "question": question, "stage": stage, "session": session,
+        "has_image": image is not None, "image_mime_type": image_mime_type,
+    }
+    if question == "AI 오류":
+        raise RuntimeError("mock agent failure")
     return "모의 답변"
 agent_service.ask_agent = ask_agent
 safety_agent_service.create_safety_agent = lambda vector_store_id, items: object()
@@ -106,6 +121,55 @@ class AgentServiceTest(unittest.TestCase):
         self.assertIn("세부 작업: 조립하기", prompt)
         self.assertIn("작업 내용: 부품을 순서대로 조립한다.", prompt)
         self.assertIn("학생 질문: 왜 흔들리나요?", prompt)
+
+    def test_multimodal_input_and_session_image_removal(self):
+        stage = {"stage_title": "만들기", "step_title": "조립", "activity": "조립한다."}
+        stored = []
+
+        class FakeSession:
+            session_id = "fake"
+
+            async def add_items(self, items):
+                stored.extend(items)
+
+        with patch.object(
+            agent_service.Runner, "run_sync",
+            return_value=SimpleNamespace(final_output="모의 답변"),
+        ) as runner:
+            agent_service.ask_agent(
+                object(), "사진을 봐 주세요.", stage, FakeSession(), b"image-bytes", "image/jpeg"
+            )
+        agent_input = runner.call_args.args[1]
+        self.assertEqual("input_text", agent_input[0]["content"][0]["type"])
+        self.assertEqual("input_image", agent_input[0]["content"][1]["type"])
+        self.assertTrue(agent_input[0]["content"][1]["image_url"].startswith("data:image/jpeg;base64,"))
+        safe_session = runner.call_args.kwargs["session"]
+        asyncio.run(safe_session.add_items(agent_input))
+        persisted = str(stored)
+        self.assertNotIn("data:image", persisted)
+        self.assertNotIn("image-bytes", persisted)
+        self.assertIn("원본은 저장하지 않음", persisted)
+
+    def test_sqlite_session_does_not_store_image_data(self):
+        async def store_and_read(path):
+            session = agent_service.SQLiteSession("image-test", path)
+            safe_session = agent_service.ImageSafeSession(session)
+            await safe_session.add_items([{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "사진 질문"},
+                    {"type": "input_image", "image_url": "data:image/jpeg;base64,PRIVATE_IMAGE"},
+                ],
+            }])
+            items = await session.get_items()
+            session.close()
+            return items
+
+        with tempfile.TemporaryDirectory() as directory:
+            items = asyncio.run(store_and_read(f"{directory}/session.db"))
+        persisted = str(items)
+        self.assertNotIn("PRIVATE_IMAGE", persisted)
+        self.assertIn("원본은 저장하지 않음", persisted)
 
 
 class SafetyAgentServiceTest(unittest.TestCase):
@@ -206,6 +270,7 @@ class StudentAppTest(unittest.TestCase):
 
         self._complete_safety(app)
         self.assertEqual("vs_1", app.session_state.test_vector_store)
+        self.assertTrue(app.chat_input[0].proto.accept_file)
         self.assertTrue(any("만들기" in item.label for item in app.expander))
         self.assertTrue(any("도구 사용법" in item.value for item in app.markdown))
 
@@ -241,6 +306,36 @@ class StudentAppTest(unittest.TestCase):
         app.session_state.test_public = {1: False, 2: False, 3: False}
         app.run()
         self.assertTrue(any("공개 실습이 없어요" in item.value for item in app.info))
+
+    def test_photo_only_combined_cancel_invalid_and_agent_failure(self):
+        app = AppTest.from_string(APP_SOURCE).run()
+        self._button(app, "start_practice_1").click().run()
+        self._complete_safety(app)
+        image = test_image_bytes()
+
+        app.chat_input[0].upload("work.jpg", image, "image/jpeg").run()
+        self.assertTrue(app.session_state.test_agent_call["has_image"])
+        self.assertEqual("이 사진에서 확인할 점을 알고 싶어요.", app.session_state.test_agent_call["question"])
+        self.assertEqual(2, len(app.session_state.messages))
+        app.run()
+        self.assertEqual(2, len(app.session_state.messages))
+
+        app.chat_input[0].upload("work.jpg", image, "image/jpeg").set_value("이 부분을 봐 주세요.").run()
+        self.assertTrue(app.session_state.test_agent_call["has_image"])
+        self.assertEqual("이 부분을 봐 주세요.", app.session_state.test_agent_call["question"])
+        self.assertEqual(4, len(app.session_state.messages))
+
+        app.chat_input[0].upload("cancel.jpg", image, "image/jpeg").clear().set_value("사진은 취소했어요.").run()
+        self.assertFalse(app.session_state.test_agent_call["has_image"])
+        self.assertEqual(6, len(app.session_state.messages))
+
+        app.chat_input[0].upload("bad.jpg", b"not-an-image", "image/jpeg").run()
+        self.assertEqual(6, len(app.session_state.messages))
+        self.assertTrue(any("올바른 JPEG 또는 PNG" in item.value for item in app.error))
+
+        app.chat_input[0].set_value("AI 오류").run()
+        self.assertEqual(7, len(app.session_state.messages))
+        self.assertTrue(any("답변을 불러오지 못했어요" in item.value for item in app.error))
 
 
 if __name__ == "__main__":

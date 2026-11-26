@@ -1,4 +1,6 @@
 
+import base64
+import copy
 import os
 
 from agents import Agent, FileSearchTool, Runner, SQLiteSession, set_default_openai_key
@@ -27,6 +29,8 @@ INSTRUCTIONS = """
 6. 부상 위험이나 장비 파손 위험이 있으면 즉시 작업 중단 및 교사 호출을 안내한다.
 7. 학생이 충분히 확인하고 시도했으면 자료에 근거한 구체적인 해결 방법을 안내한다. 수정안 재평가는 최대 3회까지만 진행하고 이후 교사 검토를 안내한다.
 8. 매 질문에 포함된 현재 제작 단계 정보를 우선하며, 이전 대화의 단계와 혼동하지 않는다.
+9. 사진에서 직접 보이는 사실과 추정을 구분하며, 사진만으로 원인이나 강도, 접착 상태, 안전성을 확정하지 않는다.
+10. 사진만으로 판단하기 어려우면 확인할 부분을 한 가지 질문하거나 다른 각도의 사진을 요청한다.
 
 [PROCESS]
 문제 상황 파악 → 원인 탐색 → 해결 방법 탐색 → 결과 확인. 학생의 답변에 따라 매뉴얼 기반 피드백, 재평가 또는 교사 확인으로 이어 간다.
@@ -63,7 +67,41 @@ def create_agent(vector_store_id: str):
     )
 
 
-def ask_agent(agent, question: str, stage: dict, session: SQLiteSession) -> str:
+class ImageSafeSession:
+    """Keep image data out of the persistent session while retaining turn context."""
+
+    def __init__(self, session):
+        self.session = session
+        self.session_id = session.session_id
+        self.session_settings = getattr(session, "session_settings", None)
+
+    async def get_items(self, limit=None):
+        return await self.session.get_items(limit=limit)
+
+    async def add_items(self, items):
+        sanitized = copy.deepcopy(items)
+        for item in sanitized:
+            content = item.get("content") if isinstance(item, dict) else None
+            if not isinstance(content, list):
+                continue
+            item["content"] = [
+                {"type": "input_text", "text": "[사진 첨부됨 - 원본은 저장하지 않음]"}
+                if isinstance(part, dict) and part.get("type") == "input_image" else part
+                for part in content
+            ]
+        await self.session.add_items(sanitized)
+
+    async def pop_item(self):
+        return await self.session.pop_item()
+
+    async def clear_session(self):
+        return await self.session.clear_session()
+
+
+def ask_agent(
+    agent, question: str, stage: dict, session: SQLiteSession,
+    image: bytes | None = None, image_mime_type: str | None = None,
+) -> str:
     prompt = (
         "[현재 제작 단계 - 이전 단계 정보보다 우선]\n"
         f"대단계: {stage['stage_title']}\n"
@@ -71,5 +109,17 @@ def ask_agent(agent, question: str, stage: dict, session: SQLiteSession) -> str:
         f"작업 내용: {stage['activity']}\n\n"
         f"학생 질문: {question}"
     )
-    result = Runner.run_sync(agent, prompt, session=session)
+    agent_input = prompt
+    run_session = session
+    if image:
+        data_url = f"data:{image_mime_type};base64,{base64.b64encode(image).decode('ascii')}"
+        agent_input = [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": data_url, "detail": "auto"},
+            ],
+        }]
+        run_session = ImageSafeSession(session)
+    result = Runner.run_sync(agent, agent_input, session=run_session)
     return str(result.final_output)
