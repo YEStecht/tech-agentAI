@@ -21,14 +21,15 @@ INSTRUCTIONS = """
 [RULES]
 1. 입력된 정보가 부족하면 공정 단계, 사용 재료 및 장비, 오류 현상을 확인한다. 한 번에 질문은 하나만 한다.
 2. 모든 피드백은 교사가 등록한 매뉴얼에 근거하며, 관련 항목을 자연스럽게 언급한다.
-3. 오류 원인이나 해결책을 바로 제시하지 않고 학생의 자가 진단을 유도한다.
+3. 오류 원인이나 해결책을 바로 제시하지 않고, 학생이 직접 관찰하거나 확인할 한 가지 방법부터 안내한다.
 4. 매뉴얼에 없는 내용을 추측하거나 외부 지식을 가져와 조언하지 않는다.
 5. 근거를 찾지 못하면 교사의 확인이 필요하다고 안내한다.
 6. 부상 위험이나 장비 파손 위험이 있으면 즉시 작업 중단 및 교사 호출을 안내한다.
-7. 학생의 수정안 재평가는 최대 3회까지만 진행하고 이후 교사 검토를 안내한다.
+7. 학생이 충분히 확인하고 시도했으면 자료에 근거한 구체적인 해결 방법을 안내한다. 수정안 재평가는 최대 3회까지만 진행하고 이후 교사 검토를 안내한다.
+8. 매 질문에 포함된 현재 제작 단계 정보를 우선하며, 이전 대화의 단계와 혼동하지 않는다.
 
 [PROCESS]
-상황 확인 → 자가 진단 질문 → 학생 답변 분석 → 매뉴얼 기반 피드백 → 재평가 또는 교사 확인.
+문제 상황 파악 → 원인 탐색 → 해결 방법 탐색 → 결과 확인. 학생의 답변에 따라 매뉴얼 기반 피드백, 재평가 또는 교사 확인으로 이어 간다.
 
 [OUTPUT]
 학생에게는 자연스러운 대화체로 답한다. 내부 단계 제목, 번호, 대괄호 및 분석 형식을 출력하지 않는다.
@@ -62,6 +63,13 @@ def create_agent(vector_store_id: str):
     )
 
 
-def ask_agent(agent, question: str, session: SQLiteSession) -> str:
-    result = Runner.run_sync(agent, question, session=session)
+def ask_agent(agent, question: str, stage: dict, session: SQLiteSession) -> str:
+    prompt = (
+        "[현재 제작 단계 - 이전 단계 정보보다 우선]\n"
+        f"대단계: {stage['stage_title']}\n"
+        f"세부 작업: {stage['step_title']}\n"
+        f"작업 내용: {stage['activity']}\n\n"
+        f"학생 질문: {question}"
+    )
+    result = Runner.run_sync(agent, prompt, session=session)
     return str(result.final_output)

@@ -51,7 +51,7 @@ def leave_practice():
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith("student_safety_check_"):
+        if key.startswith(("student_safety_check_", "selected_stage_", "selected_step_")):
             del st.session_state[key]
 
 
@@ -186,6 +186,50 @@ if not st.session_state.practice_started:
         st.rerun()
     st.stop()
 
+stage_key = f"selected_stage_{practice_id}"
+step_key = f"selected_step_{practice_id}"
+
+
+def reset_selected_step():
+    st.session_state.pop(step_key, None)
+
+
+st.subheader("현재 제작 단계")
+st.caption("실제 작업 상황이 바뀌면 언제든 단계를 다시 선택해도 돼요.")
+stage_options = [
+    f"{index + 1}단계. {stage['title']}"
+    for index, stage in enumerate(student_data["stages"])
+]
+selected_stage_label = st.selectbox(
+    "대단계",
+    options=stage_options,
+    key=stage_key,
+    on_change=reset_selected_step,
+)
+stage_index = stage_options.index(selected_stage_label)
+selected_stage = student_data["stages"][stage_index]
+step_options = [
+    f"{stage_index + 1}-{index + 1}. {step['title']}"
+    for index, step in enumerate(selected_stage["steps"])
+]
+selected_step_label = st.selectbox(
+    "세부 작업",
+    options=step_options,
+    key=step_key,
+)
+step_index = step_options.index(selected_step_label)
+selected_step = selected_stage["steps"][step_index]
+current_stage = {
+    "stage_index": stage_index,
+    "step_index": step_index,
+    "stage_title": selected_stage["title"],
+    "step_title": selected_step["title"],
+    "activity": selected_step["activity"],
+}
+with st.container(border=True):
+    st.markdown(f"**지금 하는 일: {selected_stage['title']} → {selected_step['title']}**")
+    st.write(selected_step["activity"])
+
 stage_tab, safety_tab = st.tabs(["제작 단계", "안전 체크리스트"])
 with stage_tab:
     for stage_index, stage in enumerate(student_data["stages"], start=1):
@@ -211,6 +255,8 @@ except ValueError:
 with st.sidebar:
     st.subheader("현재 실습")
     st.write(practice["title"])
+    st.subheader("현재 제작 단계")
+    st.write(f"{selected_stage['title']} → {selected_step['title']}")
     st.info("위험한 상황에서는 작업을 즉시 멈추고 선생님께 알려 주세요.")
     if st.button("새 대화 시작", use_container_width=True):
         reset_conversation(practice_id)
@@ -228,7 +274,9 @@ if question:
     with st.chat_message("assistant"):
         with st.spinner("실습 자료를 확인하고 있어요..."):
             try:
-                answer = ask_agent(agent, question, st.session_state.agent_session)
+                answer = ask_agent(
+                    agent, question, current_stage, st.session_state.agent_session
+                )
             except Exception:
                 logger.exception("학생 AI 응답 처리 실패")
                 st.error("답변을 불러오지 못했어요. 잠시 후 다시 시도하거나 선생님께 알려 주세요.")

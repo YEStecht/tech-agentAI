@@ -34,7 +34,15 @@ def get_student_data(practice_id):
         return None
     return {
         "practice": PRACTICES[practice_id],
-        "stages": [{"title": "만들기", "steps": [{"title": "자르기", "activity": "안전하게 자른다.", "source": "자료 1"}]}],
+        "stages": [
+            {"title": "만들기", "steps": [
+                {"title": "자르기", "activity": "안전하게 자른다.", "source": "자료 1"},
+                {"title": "조립하기", "activity": "부품을 순서대로 조립한다.", "source": "자료 1"},
+            ]},
+            {"title": "마무리", "steps": [
+                {"title": "검사하기", "activity": "완성 상태를 확인한다.", "source": "자료 1"},
+            ]},
+        ],
         "safety_items": [{"question": "도구 사용법을 확인했나요?", "origin": "source", "source": "자료 2"}],
         "vector_store_id": PRACTICES[practice_id]["vector_store_id"],
     }
@@ -48,7 +56,10 @@ database.list_published_practices = list_published
 database.get_student_practice_data = get_student_data
 agents.SQLiteSession = FakeSession
 agent_service.create_agent = lambda vector_store_id: st.session_state.__setitem__("test_vector_store", vector_store_id) or object()
-agent_service.ask_agent = lambda agent, question, session: "모의 답변"
+def ask_agent(agent, question, stage, session):
+    st.session_state.test_agent_call = {"question": question, "stage": stage, "session": session}
+    return "모의 답변"
+agent_service.ask_agent = ask_agent
 safety_agent_service.create_safety_agent = lambda vector_store_id, items: object()
 safety_agent_service.generate_safety_questions = lambda agent, session: ["안전 질문 1", "안전 질문 2"]
 def evaluate_safety(agent, question, answer, session):
@@ -78,6 +89,23 @@ class AgentServiceTest(unittest.TestCase):
             created = agent_service.create_agent("vs_selected")
         tool.assert_called_once_with(vector_store_ids=["vs_selected"], max_num_results=3)
         self.assertEqual([file_search], created["tools"])
+
+    def test_selected_stage_is_included_in_agent_input(self):
+        stage = {
+            "stage_title": "만들기", "step_title": "조립하기",
+            "activity": "부품을 순서대로 조립한다.",
+        }
+        with patch.object(
+            agent_service.Runner, "run_sync",
+            return_value=SimpleNamespace(final_output="모의 답변"),
+        ) as runner:
+            answer = agent_service.ask_agent(object(), "왜 흔들리나요?", stage, object())
+        prompt = runner.call_args.args[1]
+        self.assertEqual("모의 답변", answer)
+        self.assertIn("대단계: 만들기", prompt)
+        self.assertIn("세부 작업: 조립하기", prompt)
+        self.assertIn("작업 내용: 부품을 순서대로 조립한다.", prompt)
+        self.assertIn("학생 질문: 왜 흔들리나요?", prompt)
 
 
 class SafetyAgentServiceTest(unittest.TestCase):
@@ -180,6 +208,19 @@ class StudentAppTest(unittest.TestCase):
         self.assertEqual("vs_1", app.session_state.test_vector_store)
         self.assertTrue(any("만들기" in item.label for item in app.expander))
         self.assertTrue(any("도구 사용법" in item.value for item in app.markdown))
+
+        self.assertEqual("1단계. 만들기", app.selectbox[0].value)
+        self.assertEqual("1-1. 자르기", app.selectbox[1].value)
+        app.selectbox[1].select("1-2. 조립하기").run()
+        app.chat_input[0].set_value("왜 흔들리나요?").run()
+        self.assertEqual("조립하기", app.session_state.test_agent_call["stage"]["step_title"])
+        self.assertEqual(2, len(app.session_state.messages))
+        app.selectbox[0].select("2단계. 마무리").run()
+        self.assertEqual("2-1. 검사하기", app.selectbox[1].value)
+        app.chat_input[0].set_value("어디를 봐야 하나요?").run()
+        self.assertEqual("마무리", app.session_state.test_agent_call["stage"]["stage_title"])
+        self.assertEqual("검사하기", app.session_state.test_agent_call["stage"]["step_title"])
+        self.assertEqual(4, len(app.session_state.messages))
 
         self._button(app, "return_to_practices").click().run()
         self._button(app, "start_practice_2").click().run()
