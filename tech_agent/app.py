@@ -1,31 +1,43 @@
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
 from agents import SQLiteSession
 
 from agent_service import ask_agent, create_agent
-from database import get_student_practice_data, list_published_practices
+from database import (
+    create_learning_session, get_student_practice_data, init_db, list_published_practices,
+    mark_learning_safety, record_learning_question,
+)
 from image_service import prepare_image
 from safety_agent_service import (
     create_safety_agent, evaluate_safety_answer, generate_safety_questions,
 )
+from statistics_service import classify_question
 
 
 st.set_page_config(page_title="기술 제작 실습 AI 도우미", page_icon="🛠️", layout="centered")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 SESSION_DB = Path(__file__).resolve().parent.parent / ".local_data" / "student_conversations.db"
+try:
+    init_db()
+except Exception:
+    logger.exception("데이터 저장소 초기화 실패")
 
 
-def reset_conversation(practice_id):
+def reset_conversation(practice_id, reset_learning_session=False):
     session_id = f"practice-{practice_id}-{uuid.uuid4().hex}"
     os.makedirs(SESSION_DB.parent, exist_ok=True)
     st.session_state.student_session_id = session_id
     st.session_state.agent_session = SQLiteSession(session_id, str(SESSION_DB))
     st.session_state.messages = []
+    if reset_learning_session or "learning_session_id" not in st.session_state:
+        st.session_state.learning_session_id = f"learning-{practice_id}-{uuid.uuid4().hex}"
+        st.session_state.learning_started_at = datetime.now(timezone.utc).isoformat()
 
 
 def reset_safety_check(practice_id):
@@ -49,6 +61,8 @@ def leave_practice():
         "student_session_id", "agent_session", "messages", "safety_session_id",
         "safety_agent_session", "safety_questions", "safety_question_index",
         "safety_messages", "safety_complete", "practice_started",
+        "learning_started_at",
+        "learning_session_id",
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
@@ -77,7 +91,7 @@ if st.session_state.selected_practice_id is None:
             st.write(practice.get("description") or "실습 설명이 아직 없습니다.")
             if st.button("실습 시작", key=f"start_practice_{practice['id']}", type="primary"):
                 st.session_state.selected_practice_id = practice["id"]
-                reset_conversation(practice["id"])
+                reset_conversation(practice["id"], reset_learning_session=True)
                 reset_safety_check(practice["id"])
                 st.rerun()
     st.stop()
@@ -97,6 +111,23 @@ if not student_data:
     st.stop()
 
 practice = student_data["practice"]
+st.session_state.setdefault(
+    "learning_session_id", f"learning-{practice_id}-{uuid.uuid4().hex}"
+)
+st.session_state.setdefault("learning_started_at", datetime.now(timezone.utc).isoformat())
+
+
+def record_stat(operation, *args, **kwargs):
+    try:
+        operation(*args, **kwargs)
+    except Exception:
+        logger.exception("익명 학습 통계 기록 실패")
+
+
+record_stat(
+    create_learning_session, practice_id, st.session_state.learning_session_id,
+    st.session_state.learning_started_at,
+)
 st.subheader(practice["title"])
 if practice.get("description"):
     st.write(practice["description"])
@@ -123,6 +154,11 @@ if not st.session_state.safety_complete:
     if checked_count < total_count:
         st.info("모든 안전 항목을 직접 확인해야 AI 안전 점검으로 진행할 수 있어요.")
         st.stop()
+
+    record_stat(
+        mark_learning_safety, st.session_state.learning_session_id,
+        checklist_complete=True,
+    )
 
     st.subheader("2. AI 대화형 안전 점검")
     try:
@@ -173,6 +209,10 @@ if not st.session_state.safety_complete:
                 st.session_state.safety_question_index += 1
                 if st.session_state.safety_question_index == len(st.session_state.safety_questions):
                     st.session_state.safety_complete = True
+                    record_stat(
+                        mark_learning_safety, st.session_state.learning_session_id,
+                        checklist_complete=True, ai_complete=True,
+                    )
             st.rerun()
     st.stop()
 
@@ -292,6 +332,8 @@ if submission:
     if not question.strip() and not image:
         st.stop()
     display_question = question.strip() or "이 사진에서 확인할 점을 알고 싶어요."
+    event_id = uuid.uuid4().hex
+    occurred_at = datetime.now(timezone.utc).isoformat()
     st.session_state.messages.append({
         "role": "user", "content": display_question, "has_image": bool(image),
     })
@@ -301,6 +343,7 @@ if submission:
             st.image(image, caption="첨부한 제작물 사진", width="stretch")
     with st.chat_message("assistant"):
         with st.spinner("실습 자료를 확인하고 있어요..."):
+            response_success = False
             try:
                 answer = ask_agent(
                     agent, display_question, current_stage, st.session_state.agent_session,
@@ -310,5 +353,21 @@ if submission:
                 logger.exception("학생 AI 응답 처리 실패")
                 st.error("답변을 불러오지 못했어요. 잠시 후 다시 시도하거나 선생님께 알려 주세요.")
             else:
+                response_success = True
                 st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
+            finally:
+                record_stat(record_learning_question, {
+                    "event_id": event_id,
+                    "practice_id": practice_id,
+                    "session_id": st.session_state.learning_session_id,
+                    "occurred_at": occurred_at,
+                    "stage_index": current_stage["stage_index"],
+                    "stage_title": current_stage["stage_title"],
+                    "step_index": current_stage["step_index"],
+                    "step_title": current_stage["step_title"],
+                    "stage_plan_version": student_data.get("stage_plan_version"),
+                    "question_type": classify_question(display_question),
+                    "has_image": bool(image),
+                    "ai_response_success": response_success,
+                })

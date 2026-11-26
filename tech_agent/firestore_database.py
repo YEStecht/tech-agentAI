@@ -16,6 +16,8 @@ PRACTICES = "practices"
 PRACTICE_FILES = "practice_files"
 COUNTERS = "system_counters"
 COUNTER_DOCUMENT = "practice_data"
+LEARNING_SESSIONS = "anonymous_learning_sessions"
+LEARNING_QUESTIONS = "anonymous_learning_questions"
 __all__ = [
     "get_connection", "init_db", "create_practice", "list_practices", "get_practice",
     "update_practice", "set_vector_store", "list_practice_files", "delete_practice",
@@ -24,6 +26,8 @@ __all__ = [
     "get_safety_checklist", "save_safety_checklist",
     "get_publish_requirements", "set_practice_published",
     "list_published_practices", "get_student_practice_data",
+    "create_learning_session", "mark_learning_safety",
+    "record_learning_question", "get_learning_statistics",
 ]
 
 
@@ -314,6 +318,71 @@ def get_student_practice_data(practice_id):
         "stages": stage_plan["stages"],
         "safety_items": safety_checklist["items"],
         "vector_store_id": practice["vector_store_id"],
+        "stage_plan_version": stage_plan["version"],
+    }
+
+
+def create_learning_session(practice_id, session_id, started_at):
+    client = get_firestore_client()
+    reference = client.collection(LEARNING_SESSIONS).document(session_id)
+
+    def operation(transaction):
+        if reference.get(transaction=transaction).exists:
+            return False
+        transaction.set(reference, {
+            "practice_id": int(practice_id), "session_id": session_id,
+            "started_at": started_at, "safety_checklist_complete": False,
+            "ai_safety_complete": False,
+        })
+        return True
+
+    return _run_transaction(client, operation)
+
+
+def mark_learning_safety(session_id, checklist_complete=False, ai_complete=False):
+    reference = get_firestore_client().collection(LEARNING_SESSIONS).document(session_id)
+    snapshot = reference.get()
+    if not snapshot.exists:
+        return False
+    current = snapshot.to_dict()
+    reference.set({
+        "safety_checklist_complete": bool(
+            current.get("safety_checklist_complete") or checklist_complete
+        ),
+        "ai_safety_complete": bool(current.get("ai_safety_complete") or ai_complete),
+    }, merge=True)
+    return True
+
+
+def record_learning_question(event):
+    client = get_firestore_client()
+    reference = client.collection(LEARNING_QUESTIONS).document(event["event_id"])
+    allowed = {
+        "event_id", "practice_id", "session_id", "occurred_at", "stage_index",
+        "stage_title", "step_index", "step_title", "stage_plan_version",
+        "question_type", "has_image", "ai_response_success",
+    }
+    def operation(transaction):
+        if reference.get(transaction=transaction).exists:
+            return False
+        transaction.set(reference, {key: value for key, value in event.items() if key in allowed})
+        return True
+
+    return _run_transaction(client, operation)
+
+
+def get_learning_statistics(practice_id, start_date, end_date):
+    def matching(collection, timestamp):
+        snapshots = get_firestore_client().collection(collection).where(
+            "practice_id", "==", int(practice_id)
+        ).stream()
+        return [
+            item.to_dict() for item in snapshots
+            if str(start_date) <= str(item.to_dict().get(timestamp, ""))[:10] <= str(end_date)
+        ]
+    return {
+        "sessions": matching(LEARNING_SESSIONS, "started_at"),
+        "questions": matching(LEARNING_QUESTIONS, "occurred_at"),
     }
 
 

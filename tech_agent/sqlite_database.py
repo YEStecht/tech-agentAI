@@ -22,6 +22,8 @@ __all__ = [
     "get_safety_checklist", "save_safety_checklist",
     "get_publish_requirements", "set_practice_published",
     "list_published_practices", "get_student_practice_data",
+    "create_learning_session", "mark_learning_safety",
+    "record_learning_question", "get_learning_statistics",
 ]
 
 
@@ -99,6 +101,31 @@ def init_db():
                 version INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (practice_id) REFERENCES practices(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS anonymous_learning_sessions (
+                session_id TEXT PRIMARY KEY,
+                practice_id INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                safety_checklist_complete INTEGER NOT NULL DEFAULT 0,
+                ai_safety_complete INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS anonymous_learning_questions (
+                event_id TEXT PRIMARY KEY,
+                practice_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                stage_index INTEGER,
+                stage_title TEXT,
+                step_index INTEGER,
+                step_title TEXT,
+                stage_plan_version INTEGER,
+                question_type TEXT NOT NULL,
+                has_image INTEGER NOT NULL,
+                ai_response_success INTEGER NOT NULL
             )
         """)
 
@@ -271,7 +298,7 @@ def get_student_practice_data(practice_id):
         if not practice or not practice["vector_store_id"]:
             return None
         stage_plan = conn.execute(
-            "SELECT stages_json FROM practice_stage_plans WHERE practice_id = ?", (practice_id,)
+            "SELECT stages_json, version FROM practice_stage_plans WHERE practice_id = ?", (practice_id,)
         ).fetchone()
         safety_checklist = conn.execute(
             "SELECT items_json FROM practice_safety_checklists WHERE practice_id = ?",
@@ -284,7 +311,64 @@ def get_student_practice_data(practice_id):
             "stages": json.loads(stage_plan["stages_json"]),
             "safety_items": json.loads(safety_checklist["items_json"]),
             "vector_store_id": practice["vector_store_id"],
+            "stage_plan_version": int(stage_plan["version"]),
         }
+
+
+def create_learning_session(practice_id, session_id, started_at):
+    with closing(get_connection()) as conn, conn:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO anonymous_learning_sessions "
+            "(session_id, practice_id, started_at) VALUES (?, ?, ?)",
+            (session_id, int(practice_id), started_at),
+        )
+        return cursor.rowcount > 0
+
+
+def mark_learning_safety(session_id, checklist_complete=False, ai_complete=False):
+    with closing(get_connection()) as conn, conn:
+        cursor = conn.execute(
+            "UPDATE anonymous_learning_sessions SET "
+            "safety_checklist_complete = MAX(safety_checklist_complete, ?), "
+            "ai_safety_complete = MAX(ai_safety_complete, ?) WHERE session_id = ?",
+            (int(bool(checklist_complete)), int(bool(ai_complete)), session_id),
+        )
+        return cursor.rowcount > 0
+
+
+def record_learning_question(event):
+    fields = (
+        "event_id", "practice_id", "session_id", "occurred_at", "stage_index",
+        "stage_title", "step_index", "step_title", "stage_plan_version",
+        "question_type", "has_image", "ai_response_success",
+    )
+    values = [event.get(field) for field in fields]
+    values[-2:] = [int(bool(value)) for value in values[-2:]]
+    with closing(get_connection()) as conn, conn:
+        cursor = conn.execute(
+            f"INSERT OR IGNORE INTO anonymous_learning_questions ({', '.join(fields)}) "
+            f"VALUES ({', '.join('?' for _ in fields)})",
+            values,
+        )
+        return cursor.rowcount > 0
+
+
+def get_learning_statistics(practice_id, start_date, end_date):
+    with closing(get_connection()) as conn:
+        sessions = conn.execute(
+            "SELECT * FROM anonymous_learning_sessions WHERE practice_id = ? "
+            "AND substr(started_at, 1, 10) BETWEEN ? AND ?",
+            (int(practice_id), str(start_date), str(end_date)),
+        ).fetchall()
+        questions = conn.execute(
+            "SELECT * FROM anonymous_learning_questions WHERE practice_id = ? "
+            "AND substr(occurred_at, 1, 10) BETWEEN ? AND ?",
+            (int(practice_id), str(start_date), str(end_date)),
+        ).fetchall()
+    return {
+        "sessions": [dict(item) for item in sessions],
+        "questions": [dict(item) for item in questions],
+    }
 
 
 def save_safety_checklist(practice_id, items, expected_version=None):

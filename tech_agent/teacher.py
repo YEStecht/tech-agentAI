@@ -185,8 +185,6 @@ elif menu == "AI 생성 자료 검토":
         render_safety_editor()
 
 else:
-    st.subheader("📊 익명 통계")
-    st.info(
-        "다음 단계에서 실습 단계별·질문 유형별 "
-        "익명 통계를 구현합니다."
-    )
+    from statistics_ui import render_statistics_dashboard
+
+    render_statistics_dashboard()

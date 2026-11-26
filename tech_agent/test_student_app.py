@@ -29,6 +29,9 @@ import safety_agent_service
 import streamlit as st
 
 st.session_state.setdefault("test_public", {1: True, 2: True, 3: False})
+st.session_state.setdefault("test_stat_sessions", {})
+st.session_state.setdefault("test_stat_questions", {})
+st.session_state.setdefault("test_stat_failure", False)
 
 PRACTICES = {
     1: {"id": 1, "title": "공개 실습 A", "description": "설명 A", "is_published": 1, "vector_store_id": "vs_1"},
@@ -55,6 +58,7 @@ def get_student_data(practice_id):
         ],
         "safety_items": [{"question": "도구 사용법을 확인했나요?", "origin": "source", "source": "자료 2"}],
         "vector_store_id": PRACTICES[practice_id]["vector_store_id"],
+        "stage_plan_version": 3,
     }
 
 class FakeSession:
@@ -64,6 +68,26 @@ class FakeSession:
 
 database.list_published_practices = list_published
 database.get_student_practice_data = get_student_data
+database.init_db = lambda: None
+def create_learning_session(practice_id, session_id, started_at):
+    if st.session_state.test_stat_failure:
+        raise RuntimeError("mock statistics failure")
+    before = len(st.session_state.test_stat_sessions)
+    st.session_state.test_stat_sessions.setdefault(session_id, {
+        "practice_id": practice_id, "started_at": started_at,
+    })
+    return len(st.session_state.test_stat_sessions) > before
+def mark_learning_safety(session_id, **values):
+    if st.session_state.test_stat_failure:
+        raise RuntimeError("mock statistics failure")
+    st.session_state.test_stat_sessions[session_id].update(values)
+def record_learning_question(event):
+    if st.session_state.test_stat_failure:
+        raise RuntimeError("mock statistics failure")
+    st.session_state.test_stat_questions.setdefault(event["event_id"], event)
+database.create_learning_session = create_learning_session
+database.mark_learning_safety = mark_learning_safety
+database.record_learning_question = record_learning_question
 agents.SQLiteSession = FakeSession
 agent_service.create_agent = lambda vector_store_id: st.session_state.__setitem__("test_vector_store", vector_store_id) or object()
 def ask_agent(agent, question, stage, session, image=None, image_mime_type=None):
@@ -252,7 +276,7 @@ class StudentAppTest(unittest.TestCase):
         return app
 
     def test_selection_data_session_switch_and_private_access_block(self):
-        app = AppTest.from_string(APP_SOURCE).run()
+        app = AppTest.from_string(APP_SOURCE).run(timeout=10)
         visible = " ".join(item.value for item in app.markdown)
         self.assertIn("공개 실습 A", visible)
         self.assertIn("공개 실습 B", visible)
@@ -286,6 +310,15 @@ class StudentAppTest(unittest.TestCase):
         self.assertEqual("마무리", app.session_state.test_agent_call["stage"]["stage_title"])
         self.assertEqual("검사하기", app.session_state.test_agent_call["stage"]["step_title"])
         self.assertEqual(4, len(app.session_state.messages))
+        stats = list(app.session_state.test_stat_questions.values())
+        self.assertEqual(2, len(stats))
+        self.assertEqual(3, stats[-1]["stage_plan_version"])
+        self.assertEqual("마무리", stats[-1]["stage_title"])
+        self.assertNotIn("question", stats[-1])
+        learning_session = app.session_state.learning_session_id
+        self._button_label(app, "새 대화 시작").click().run()
+        self.assertEqual(learning_session, app.session_state.learning_session_id)
+        self.assertEqual(1, len(app.session_state.test_stat_sessions))
 
         self._button(app, "return_to_practices").click().run()
         self._button(app, "start_practice_2").click().run()
@@ -295,6 +328,7 @@ class StudentAppTest(unittest.TestCase):
         self.assertFalse(app.session_state.safety_complete)
         self.assertEqual([], app.session_state.safety_questions)
         self.assertEqual([], app.session_state.messages)
+        self.assertEqual(2, len(app.session_state.test_stat_sessions))
 
         app.session_state.test_public = {1: True, 2: False, 3: False}
         app.run()
@@ -336,6 +370,10 @@ class StudentAppTest(unittest.TestCase):
         app.chat_input[0].set_value("AI 오류").run()
         self.assertEqual(7, len(app.session_state.messages))
         self.assertTrue(any("답변을 불러오지 못했어요" in item.value for item in app.error))
+
+        app.session_state.test_stat_failure = True
+        app.chat_input[0].set_value("통계 실패에도 답변해 주세요.").run()
+        self.assertTrue(any("모의 답변" in item.value for item in app.markdown))
 
 
 if __name__ == "__main__":
