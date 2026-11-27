@@ -130,7 +130,11 @@ def render_safety_editor():
     if not practice["vector_store_id"]:
         st.warning("이 실습에는 RAG 자료가 없습니다.")
     else:
-        if st.button("✨ AI 안전 체크리스트 생성", use_container_width=True):
+        generate_label = (
+            "✨ AI 안전 체크리스트 다시 생성" if practice_id in drafts
+            else "✨ AI 안전 체크리스트 생성"
+        )
+        if st.button(generate_label, use_container_width=True):
             if practice_id in drafts:
                 pending_replace[practice_id] = "regenerate"
                 st.rerun()

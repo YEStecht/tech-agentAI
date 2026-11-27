@@ -19,6 +19,22 @@ from knowledge_service import (
 from publication_ui import render_publication_controls
 
 st.set_page_config(page_title="기술 제작 실습 · 교사 관리", page_icon="🔐", layout="wide")
+st.markdown(
+    """
+    <style>
+    .stApp { background: linear-gradient(180deg, #f4fbff 0, #fffdf7 32rem); }
+    .stApp button { min-height: 2.65rem; border-radius: .75rem; white-space: normal; }
+    .stApp input, .stApp textarea { font-size: 1rem; }
+    .stApp p, .stApp li { color: #334155; overflow-wrap: anywhere; }
+    .stApp label p { font-size: 1rem; line-height: 1.45; }
+    @media (max-width: 640px) {
+        .stApp h1 { font-size: 1.8rem; }
+        .stApp h2 { font-size: 1.35rem; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 firebase_config = {
     "apiKey": get_setting("FIREBASE_API_KEY"),
     "authDomain": get_setting("FIREBASE_AUTH_DOMAIN"),
@@ -41,6 +57,7 @@ try:
     actor = authorize(identity)
 except AuthenticationError as exc:
     st.session_state.pop("firebase_id_token", None)
+    secure_database.set_actor(None)
     st.title("🔐 교사 Google 로그인")
     st.warning(str(exc))
     st.caption("승인된 교사 계정만 접근할 수 있습니다. 위의 Google 로그인 버튼을 사용하세요.")
@@ -54,55 +71,59 @@ secure_database.set_actor(actor)
 init_db()
 
 with st.sidebar:
-    st.header("교사 관리")
-    menus = ["실습 관리", "AI 생성 자료 검토", "익명 통계"]
+    st.header("🧑‍🏫 교사 메뉴")
+    menus = ["🧩 실습 관리", "📊 학습 통계"]
     if actor["role"] == "admin":
-        menus.append("교사 계정 관리")
-    menu = st.radio("메뉴", menus)
-    st.caption(actor["email"])
+        menus.append("👥 교사 권한 관리")
+    menu = st.radio("이동할 메뉴", menus)
+    st.divider()
+    st.caption(f"로그인 · {actor['email']}")
     if st.button("로그아웃", use_container_width=True):
         st.session_state.pop("firebase_id_token", None)
+        secure_database.set_actor(None)
         st.session_state["firebase_logout_requested"] = True
         st.rerun()
 
 st.title("📚 기술 제작 실습 · 교사 관리")
 st.caption("실습 자료는 교사가 검토·승인하기 전까지 학생에게 공개되지 않습니다.")
 
-if menu == "실습 관리":
-    st.subheader("🧩 새 실습 등록")
-    with st.form("new_practice", clear_on_submit=True):
-        new_title = st.text_input("실습명", placeholder="예: 목재 생활용품 만들기")
-        new_description = st.text_area("실습 설명", placeholder="학습 목표와 제작 활동을 간단히 입력하세요.")
-        create_submitted = st.form_submit_button("실습 등록", type="primary")
-    if create_submitted:
-        try:
-            practice_id = create_practice(new_title, new_description)
-            st.success(f"실습이 등록됐어요! (번호: {practice_id})")
-        except ValueError as exc:
-            st.warning(str(exc))
-        except Exception:
-            st.error("실습 등록 중 오류가 발생했습니다. 서버 로그를 확인해 주세요.")
-
-    st.divider()
-    st.subheader("📁 등록된 실습 관리")
+if menu == "🧩 실습 관리":
+    st.info("① 기본 정보 → ② 자료·RAG → ③ 제작 단계 검토 → ④ 안전 체크리스트 검토 → ⑤ 공개")
+    st.subheader("① 등록된 실습 기본 정보")
     practices = list_practices()
     if not practices:
-        st.info("아직 등록된 실습이 없습니다. 위에서 첫 실습을 등록해 주세요.")
+        st.info("아직 등록된 실습이 없습니다. 아래에서 첫 실습을 등록해 주세요.")
+
+    if practices:
+        options = {p["id"]: f"#{p['id']} · {p['title']}" for p in practices}
+        selected_id = st.selectbox(
+            "관리할 실습 선택",
+            options=list(options),
+            format_func=lambda pid: options[pid],
+        )
+    with st.expander("➕ 새 실습 등록"):
+        with st.form("new_practice", clear_on_submit=True):
+            new_title = st.text_input("실습명", placeholder="예: 목재 생활용품 만들기")
+            new_description = st.text_area("실습 설명", placeholder="학습 목표와 제작 활동을 간단히 입력하세요.")
+            create_submitted = st.form_submit_button("실습 등록", type="primary")
+        if create_submitted:
+            try:
+                practice_id = create_practice(new_title, new_description)
+                st.success(f"실습이 등록됐어요! (번호: {practice_id})")
+                st.rerun()
+            except ValueError as exc:
+                st.warning(str(exc))
+            except Exception:
+                st.error("실습 등록 중 오류가 발생했습니다. 서버 로그를 확인해 주세요.")
+    if not practices:
         st.stop()
 
-    options = {p["id"]: f"#{p['id']} · {p['title']}" for p in practices}
-    selected_id = st.selectbox(
-        "관리할 실습 선택",
-        options=list(options),
-        format_func=lambda pid: options[pid],
-    )
     practice = get_practice(selected_id)
     if not practice:
         st.warning("실습을 찾지 못했습니다. 페이지를 새로고침해 주세요.")
         st.stop()
 
     st.caption("🔒 비공개" if not practice["is_published"] else "🟢 공개 상태")
-    render_publication_controls(selected_id)
     with st.expander("✏️ 실습 정보 수정"):
         with st.form(f"edit_{selected_id}"):
             edited_title = st.text_input("실습명", value=practice["title"])
@@ -116,12 +137,13 @@ if menu == "실습 관리":
                     st.warning(str(exc))
 
     st.divider()
-    st.subheader("📤 실습 자료 업로드")
+    st.subheader("② 실습 자료 업로드 및 RAG 색인")
     st.write("PDF, DOCX, PPTX, TXT, MD 파일을 등록하면 이 실습 전용 검색 자료로 색인합니다.")
     st.caption("파일당 최대 20MB · 이미지로만 된 PDF는 검색되지 않을 수 있어요.")
     upload = st.file_uploader(
         "실습 매뉴얼이나 안전 자료 선택",
         type=[e.lstrip(".") for e in sorted(SUPPORTED_EXTENSIONS)],
+        max_upload_size=20,
         key=f"upload_{selected_id}",
     )
     if upload is not None and st.button("자료 업로드 및 RAG 색인", type="primary"):
@@ -193,27 +215,32 @@ if menu == "실습 관리":
                             st.session_state.pop("confirm_delete_file", None)
                             st.rerun()
 
-    st.caption("현재 단계에서는 실습 자체 삭제와 공개 전환을 지원하지 않습니다. 안전 체크리스트 승인 기능을 구현한 뒤 추가할 예정입니다.")
-
-
-
-elif menu == "AI 생성 자료 검토":
+    st.divider()
     from stage_ui import render_stage_editor
     from safety_ui import render_safety_editor
 
-    stage_tab, safety_tab = st.tabs(["제작 단계", "안전 체크리스트"])
+    stage_tab, safety_tab = st.tabs(["③ 제작 단계 생성·검토", "④ 안전 체크리스트 생성·검토"])
     with stage_tab:
         render_stage_editor()
     with safety_tab:
         render_safety_editor()
 
-elif menu == "익명 통계":
+    st.divider()
+    st.subheader("⑤ 실습 공개")
+    render_publication_controls(selected_id)
+
+elif menu == "📊 학습 통계":
     from statistics_ui import render_statistics_dashboard
 
     render_statistics_dashboard()
 
 else:
-    st.subheader("👥 교사 계정 관리")
+    st.subheader("👥 교사 권한 관리")
+    st.caption("이 화면은 웹앱 접근 권한을 관리합니다. Google 계정 자체는 변경하거나 삭제하지 않습니다.")
+    with st.container(border=True):
+        st.markdown("**🛡️ 최고 관리자**")
+        st.write(admin_email())
+        st.caption("ADMIN_EMAIL 설정으로 보호됨 · 항상 활성 · 비활성화 및 삭제 불가")
     with st.form("add_teacher", clear_on_submit=True):
         teacher_email = st.text_input("교사 Google 이메일")
         school_id = st.text_input("학교 식별자", help="같은 값을 가진 승인 교사끼리 자료를 공동 관리합니다.")
@@ -224,20 +251,31 @@ else:
                 st.rerun()
             except ValueError as exc:
                 st.warning(str(exc))
-    for teacher in list_teachers(actor):
+    teachers = [
+        teacher for teacher in list_teachers(actor)
+        if str(teacher.get("email", "")).casefold() != admin_email().casefold()
+    ]
+    if not teachers:
+        st.info("등록된 일반 교사가 없습니다.")
+    for teacher in teachers:
         email = teacher.get("email", "")
         with st.container(border=True):
-            st.write(f"**{email}** · {teacher.get('school_id', '-')}")
-            st.caption(f"등록일: {teacher.get('created_at', '-')} · {'활성' if teacher.get('active') else '비활성'}")
-            if st.button("비활성화" if teacher.get("active") else "활성화", key=f"active_{teacher['id']}"):
-                set_teacher_active(actor, email, not teacher.get("active"))
-                st.rerun()
+            st.markdown(f"**{email}**")
+            st.write(f"학교 식별자 · {teacher.get('school_id', '-')}")
+            st.caption(f"상태 · {'🟢 활성' if teacher.get('active') else '⚪ 비활성'} · 등록일 {teacher.get('created_at', '-')}")
+            active_col, delete_col = st.columns(2)
+            if active_col.button(
+                "비활성화" if teacher.get("active") else "활성화",
+                key=f"active_{teacher['id']}", use_container_width=True,
+            ):
+                set_teacher_active(actor, email, not teacher.get("active")); st.rerun()
             confirm_key = f"confirm_teacher_delete_{teacher['id']}"
-            if st.button("권한 삭제", key=f"delete_{teacher['id']}"):
+            if delete_col.button("접근 권한 삭제", key=f"delete_{teacher['id']}", use_container_width=True):
                 st.session_state[confirm_key] = True
             if st.session_state.get(confirm_key):
-                st.warning("이 교사의 접근 권한을 삭제할까요?")
-                if st.button("삭제 확인", key=f"delete_confirm_{teacher['id']}", type="primary"):
-                    delete_teacher(actor, email)
-                    st.session_state.pop(confirm_key, None)
-                    st.rerun()
+                st.warning("이 교사의 웹앱 접근 권한을 삭제할까요? Google 계정은 삭제되지 않습니다.")
+                confirm_col, cancel_col = st.columns(2)
+                if confirm_col.button("권한 삭제 확인", key=f"delete_confirm_{teacher['id']}", type="primary"):
+                    delete_teacher(actor, email); st.session_state.pop(confirm_key, None); st.rerun()
+                if cancel_col.button("취소", key=f"delete_cancel_{teacher['id']}"):
+                    st.session_state.pop(confirm_key, None); st.rerun()

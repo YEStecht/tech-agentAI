@@ -1,22 +1,35 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"></head><body>
+<html lang="ko"><head><meta charset="utf-8"><style>
+*{box-sizing:border-box}body{margin:0;padding:4px 0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#334155}
+button{min-height:48px;padding:0 24px;border:1px solid #cbd5e1;border-radius:12px;background:#fff;color:#1e293b;font-size:16px;font-weight:700;box-shadow:0 2px 8px #0f172a1a;cursor:pointer}
+button:hover{background:#eff6ff;border-color:#60a5fa}button:focus-visible{outline:3px solid #93c5fd;outline-offset:2px}
+#status{display:inline-block;padding:13px 4px;font-size:15px;color:#475569}
+</style></head><body>
 <button id="login" hidden>Google로 로그인</button><span id="status">로그인 확인 중…</span>
 <script type="module">
 import {initializeApp} from "https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js";
 import {getAuth, GoogleAuthProvider, onIdTokenChanged, signInWithPopup, signOut} from "https://www.gstatic.com/firebasejs/11.0.2/firebase-auth.js";
 const send=(type,data={})=>parent.postMessage({isStreamlitMessage:true,type,...data},"*");
-send("streamlit:componentReady",{apiVersion:1}); send("streamlit:setFrameHeight",{height:45});
+send("streamlit:componentReady",{apiVersion:1}); send("streamlit:setFrameHeight",{height:64});
 let auth, lastLogout=false;
+async function performLogout(){
+  try{await signOut(auth);}
+  catch{lastLogout=false;}
+}
 addEventListener("message", async event => {
   if(event.data?.type!=="streamlit:render") return;
   const args=event.data.args;
-  if(auth){if(!args.logout) lastLogout=false; if(args.logout && !lastLogout){lastLogout=true; await signOut(auth);} return;}
+  if(auth){
+    if(!args.logout) lastLogout=false;
+    if(args.logout && !lastLogout){lastLogout=true; await performLogout();}
+    return;
+  }
   const app=initializeApp(args.config); auth=getAuth(app);
   document.querySelector("#login").onclick=()=>signInWithPopup(auth,new GoogleAuthProvider()).catch(()=>send("streamlit:setComponentValue",{value:{error:true}}));
   onIdTokenChanged(auth,async user=>{
-    document.querySelector("#login").hidden=!!user; document.querySelector("#status").textContent=user?user.email:"";
+    document.querySelector("#login").hidden=!!user; document.querySelector("#status").textContent="";
     send("streamlit:setComponentValue",{value:user?{token:await user.getIdToken(true)}:{token:null}});
   });
-  if(args.logout && !lastLogout){lastLogout=true; await signOut(auth);}
+  if(args.logout && !lastLogout){lastLogout=true; await performLogout();}
 });
 </script></body></html>

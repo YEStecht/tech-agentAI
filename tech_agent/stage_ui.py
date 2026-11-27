@@ -136,7 +136,11 @@ def render_stage_editor():
     if not practice["vector_store_id"]:
         st.warning("이 실습에는 RAG 자료가 없습니다. 실습 관리에서 자료를 먼저 업로드해 주세요.")
     else:
-        if st.button("✨ AI 제작 단계 초안 생성", use_container_width=True):
+        generate_label = (
+            "✨ AI 제작 단계 다시 생성" if practice_id in drafts
+            else "✨ AI 제작 단계 초안 생성"
+        )
+        if st.button(generate_label, use_container_width=True):
             if practice_id in drafts:
                 pending_replace[practice_id] = "regenerate"
                 st.rerun()

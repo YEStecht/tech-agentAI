@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import auth
@@ -11,6 +12,14 @@ from auth import AuthenticationError, Identity
 
 
 class AuthenticationTest(unittest.TestCase):
+    def test_firebase_component_keeps_original_logout_protocol(self):
+        source = (Path(__file__).parent / "firebase_auth_frontend" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("if(args.logout && !lastLogout)", source)
+        self.assertIn("await performLogout()", source)
+        self.assertNotIn("signed_out", source)
+
     def test_verified_firebase_token_is_accepted(self):
         claims = {"uid": "uid-1", "email": "Teacher@Example.com", "email_verified": True}
         with patch.object(auth.firebase_auth, "verify_id_token", return_value=claims), \
@@ -76,12 +85,30 @@ class PermissionTest(unittest.TestCase):
         teacher = {"role": "teacher", "email": "t@example.com"}
         with self.assertRaises(AuthenticationError):
             teacher_permissions.require_admin(teacher)
+        with self.assertRaises(AuthenticationError):
+            teacher_permissions.list_teachers(teacher)
         admin = {"role": "admin", "email": "admin@example.com"}
         with patch.object(teacher_permissions, "admin_email", return_value="admin@example.com"), \
              patch.object(teacher_permissions, "_reference") as reference:
             reference.return_value.get.return_value.exists = True
             with self.assertRaisesRegex(ValueError, "이미 등록"):
                 teacher_permissions.add_teacher(admin, "new@example.com", "school")
+
+    def test_admin_can_list_firestore_teacher_fields(self):
+        snapshot = MagicMock(id="teacher-document")
+        snapshot.to_dict.return_value = {
+            "email": "teacher@example.com", "school_id": "school-a", "active": True,
+        }
+        client = MagicMock()
+        client.collection.return_value.stream.return_value = [snapshot]
+        admin = {"role": "admin", "email": "admin@example.com"}
+        with patch.object(teacher_permissions, "admin_email", return_value="admin@example.com"), \
+             patch.object(teacher_permissions, "get_firestore_client", return_value=client):
+            teachers = teacher_permissions.list_teachers(admin)
+        self.assertEqual(
+            ("teacher@example.com", "school-a", True, "teacher-document"),
+            (teachers[0]["email"], teachers[0]["school_id"], teachers[0]["active"], teachers[0]["id"]),
+        )
 
 
 class SecureDatabaseTest(unittest.TestCase):

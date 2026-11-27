@@ -8,8 +8,8 @@ from publication import PracticePublishError
 
 REQUIREMENTS = (
     ("rag_ready", "실습 자료 및 RAG 색인", "자료를 업로드하고 색인을 완료해 주세요."),
-    ("stage_plan_saved", "검토한 제작 단계 저장본", "AI 생성 자료 검토에서 제작 단계를 저장해 주세요."),
-    ("safety_checklist_saved", "검토한 안전 체크리스트 저장본", "AI 생성 자료 검토에서 안전 체크리스트를 저장해 주세요."),
+    ("stage_plan_saved", "검토한 제작 단계 저장본", "실습 관리의 ③ 제작 단계에서 저장해 주세요."),
+    ("safety_checklist_saved", "검토한 안전 체크리스트 저장본", "실습 관리의 ④ 안전 체크리스트에서 저장해 주세요."),
 )
 
 
@@ -25,7 +25,7 @@ def render_publication_controls(practice_id):
         return
 
     published = bool(practice["is_published"])
-    st.subheader("📢 실습 공개 관리")
+    st.markdown("#### 공개 준비 상태")
     st.info("현재 공개 상태: " + ("🟢 공개" if published else "🔒 비공개"))
     for key, label, help_text in REQUIREMENTS:
         if requirements[key]:

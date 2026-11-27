@@ -64,13 +64,17 @@ class StatisticsDashboardTest(unittest.TestCase):
         populated = AppTest.from_string(DASHBOARD_SOURCE)
         populated.session_state.stats_data = {
             "sessions": [{"safety_checklist_complete": True, "ai_safety_complete": True}],
-            "questions": [question("q1", has_image=True)],
+            "questions": [question(
+                "q1", has_image=True,
+                stage_title="길어도 잘리지 않아야 하는 제작 단계 이름",
+                step_title="길어도 전체 내용을 확인할 수 있어야 하는 세부 작업 이름",
+            )],
         }
         populated.run(timeout=15)
         self.assertEqual(4, len(populated.metric))
         headings = " ".join(item.value for item in populated.markdown)
-        self.assertIn("제작 대단계별 질문", headings)
-        self.assertIn("날짜별 질문 추이", headings)
+        self.assertIn("제작 단계별 질문 수", headings)
+        self.assertIn("날짜별 질문 수 추이", headings)
         self.assertTrue(any("실제 학생 수가 아니며" in item.value for item in populated.caption))
 
 

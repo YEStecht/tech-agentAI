@@ -165,11 +165,11 @@ class SafetyAppTest(unittest.TestCase):
         self._button(app, "안전 체크리스트 저장").click().run()
         self.assertEqual("저장한 초안 A", app.session_state.test_saved["items"][0]["question"])
 
-        self._button(app, "AI 안전 체크리스트 생성").click().run()
+        self._button(app, "AI 안전 체크리스트 다시 생성").click().run()
         self._button(app, "취소").click().run()
         self.assertEqual("저장한 초안 A", self._question(app).value)
 
-        self._button(app, "AI 안전 체크리스트 생성").click().run()
+        self._button(app, "AI 안전 체크리스트 다시 생성").click().run()
         next(button for button in app.button if button.key == "confirm_safety_regenerate_999").click().run()
         self.assertEqual("초안 B", self._question(app).value)
         self.assertEqual("저장한 초안 A", app.session_state.test_saved["items"][0]["question"])
