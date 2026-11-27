@@ -90,14 +90,27 @@ database.mark_learning_safety = mark_learning_safety
 database.record_learning_question = record_learning_question
 agents.SQLiteSession = FakeSession
 agent_service.create_agent = lambda vector_store_id: st.session_state.__setitem__("test_vector_store", vector_store_id) or object()
-def ask_agent(agent, question, stage, session, image=None, image_mime_type=None):
+def ask_agent(agent, question, stages, session, image=None, image_mime_type=None, selected_stage=None):
     st.session_state.test_agent_call = {
-        "question": question, "stage": stage, "session": session,
+        "question": question, "stages": stages, "selected_stage": selected_stage, "session": session,
         "has_image": image is not None, "image_mime_type": image_mime_type,
     }
     if question == "AI 오류":
         raise RuntimeError("mock agent failure")
-    return "모의 답변"
+    conflict = bool(image is not None and selected_stage)
+    if conflict:
+        stage_index, step_index = 1, 0
+    elif selected_stage:
+        stage_index, step_index = selected_stage["stage_index"], selected_stage["step_index"]
+    elif "조립" in question or "흔들" in question:
+        stage_index, step_index = 0, 1
+    else:
+        stage_index = step_index = None
+    return agent_service.DiagnosisTurn(
+        answer="모의 답변", stage_index=stage_index, step_index=step_index,
+        stage_conflict=conflict,
+        question_type="문제 원인 및 해결" if "왜" in question else "기타",
+    )
 agent_service.ask_agent = ask_agent
 safety_agent_service.create_safety_agent = lambda vector_store_id, items: object()
 safety_agent_service.generate_safety_questions = lambda agent, session: ["안전 질문 1", "안전 질문 2"]
@@ -128,26 +141,31 @@ class AgentServiceTest(unittest.TestCase):
             created = agent_service.create_agent("vs_selected")
         tool.assert_called_once_with(vector_store_ids=["vs_selected"], max_num_results=3)
         self.assertEqual([file_search], created["tools"])
+        self.assertEqual(agent_service.DiagnosisTurn, created["output_type"])
 
     def test_selected_stage_is_included_in_agent_input(self):
-        stage = {
-            "stage_title": "만들기", "step_title": "조립하기",
-            "activity": "부품을 순서대로 조립한다.",
-        }
+        stages = [{"title": "만들기", "steps": [
+            {"title": "조립하기", "activity": "부품을 순서대로 조립한다."},
+        ]}]
+        selected = {"stage_index": 0, "step_index": 0, "stage_title": "만들기",
+                    "step_title": "조립하기", "activity": "부품을 순서대로 조립한다."}
         with patch.object(
             agent_service.Runner, "run_sync",
-            return_value=SimpleNamespace(final_output="모의 답변"),
+            return_value=SimpleNamespace(final_output=agent_service.DiagnosisTurn(
+                answer="모의 답변", stage_index=0, step_index=0, question_type="문제 원인 및 해결"
+            )),
         ) as runner:
-            answer = agent_service.ask_agent(object(), "왜 흔들리나요?", stage, object())
+            turn = agent_service.ask_agent(
+                object(), "왜 흔들리나요?", stages, object(), selected_stage=selected
+            )
         prompt = runner.call_args.args[1]
-        self.assertEqual("모의 답변", answer)
-        self.assertIn("대단계: 만들기", prompt)
-        self.assertIn("세부 작업: 조립하기", prompt)
-        self.assertIn("작업 내용: 부품을 순서대로 조립한다.", prompt)
+        self.assertEqual("모의 답변", turn.answer)
+        self.assertIn("전체 제작 단계 계획", prompt)
+        self.assertIn("학생이 직접 지정한 참고 단계", prompt)
         self.assertIn("학생 질문: 왜 흔들리나요?", prompt)
 
     def test_multimodal_input_and_session_image_removal(self):
-        stage = {"stage_title": "만들기", "step_title": "조립", "activity": "조립한다."}
+        stages = [{"title": "만들기", "steps": [{"title": "조립", "activity": "조립한다."}]}]
         stored = []
 
         class FakeSession:
@@ -158,14 +176,16 @@ class AgentServiceTest(unittest.TestCase):
 
         with patch.object(
             agent_service.Runner, "run_sync",
-            return_value=SimpleNamespace(final_output="모의 답변"),
+            return_value=SimpleNamespace(final_output=agent_service.DiagnosisTurn(answer="모의 답변")),
         ) as runner:
             agent_service.ask_agent(
-                object(), "사진을 봐 주세요.", stage, FakeSession(), b"image-bytes", "image/jpeg"
+                object(), "사진을 봐 주세요.", stages, FakeSession(), b"image-bytes", "image/jpeg"
             )
         agent_input = runner.call_args.args[1]
         self.assertEqual("input_text", agent_input[0]["content"][0]["type"])
         self.assertEqual("input_image", agent_input[0]["content"][1]["type"])
+        self.assertEqual("input_text", agent_input[0]["content"][2]["type"])
+        self.assertIn("강제 조건 아님", agent_input[0]["content"][2]["text"])
         self.assertTrue(agent_input[0]["content"][1]["image_url"].startswith("data:image/jpeg;base64,"))
         safe_session = runner.call_args.kwargs["session"]
         asyncio.run(safe_session.add_items(agent_input))
@@ -173,6 +193,37 @@ class AgentServiceTest(unittest.TestCase):
         self.assertNotIn("data:image", persisted)
         self.assertNotIn("image-bytes", persisted)
         self.assertIn("원본은 저장하지 않음", persisted)
+        self.assertIn("사진 전체의 제작물 형태와 반복 구조", agent_service.INSTRUCTIONS)
+        self.assertIn("보이지 않는 재료·치수·접착 상태를 단정하지", agent_service.INSTRUCTIONS)
+        self.assertIn("구조 안전성이나 접착 강도를 확정하지", agent_service.INSTRUCTIONS)
+        self.assertIn("사진만 첨부", agent_service.INSTRUCTIONS)
+        self.assertIn("고정 테이프", agent_service.INSTRUCTIONS)
+
+    def test_stage_and_question_type_are_server_validated(self):
+        stages = [{"title": "만들기", "steps": [{"title": "조립", "activity": "조립"}]}]
+        valid = agent_service.DiagnosisTurn(
+            answer="답", stage_index=0, step_index=0, question_type="제작 방법"
+        )
+        invalid = agent_service.DiagnosisTurn(
+            answer="답", stage_index=-1, step_index=9, question_type="임의 유형"
+        )
+        self.assertEqual("조립", agent_service.resolve_stage(stages, valid)["confirmed"]["step_title"])
+        self.assertIsNone(agent_service.resolve_stage(stages, invalid, has_image=True)["confirmed"])
+        self.assertEqual("기타", agent_service.validated_question_type(invalid, "기타"))
+
+    def test_new_evidence_can_replace_a_directly_selected_stage(self):
+        stages = [
+            {"title": "재료 준비", "steps": [{"title": "묶음 만들기", "activity": "묶는다."}]},
+            {"title": "트러스 조립", "steps": [{"title": "구조 확인", "activity": "형태를 본다."}]},
+        ]
+        selected = {"stage_index": 0, "step_index": 0, "stage_title": "재료 준비",
+                    "step_title": "묶음 만들기", "activity": "묶는다."}
+        inferred = agent_service.DiagnosisTurn(answer="사진 관찰", stage_index=1, step_index=0)
+        resolved = agent_service.resolve_stage(stages, inferred, selected, has_image=True)
+        self.assertTrue(resolved["conflict"])
+        self.assertIsNone(resolved["confirmed"])
+        self.assertEqual(("트러스 조립", "구조 확인"),
+                         (resolved["inferred"]["stage_title"], resolved["inferred"]["step_title"]))
 
     def test_sqlite_session_does_not_store_image_data(self):
         async def store_and_read(path):
@@ -211,6 +262,14 @@ class SafetyAgentServiceTest(unittest.TestCase):
         tool.assert_called_once_with(vector_store_ids=["vs_safety"], max_num_results=3)
         self.assertEqual(safety_agent_service.SafetyTurn, created["output_type"])
         self.assertIn("보안경을 확인했나요?", created["instructions"])
+        self.assertIn("질문 하나에는 안전 규칙 하나", created["instructions"])
+        self.assertIn("한두 문장", created["instructions"])
+        self.assertIn("'네'로 끝나는 질문보다", created["instructions"])
+        self.assertIn("어떻게 해야 할까요?", created["instructions"])
+        self.assertIn("아직 하지 않은 작업의 완료 여부", created["instructions"])
+        self.assertIn("표현이 달라도 통과", created["instructions"])
+        self.assertIn("짧은 힌트", created["instructions"])
+        self.assertIn("즉시 작업 중지", created["instructions"])
 
     def test_structured_questions_and_evaluation_are_validated(self):
         session = object()
@@ -298,26 +357,45 @@ class StudentAppTest(unittest.TestCase):
         self.assertTrue(any("만들기" in item.label for item in app.expander))
         self.assertTrue(any("도구 사용법" in item.value for item in app.markdown))
 
+        self.assertEqual(0, len(app.selectbox))
+        app.chat_input[0].set_value("왜 조립한 부분이 흔들리나요?").run()
+        self.assertIsNone(app.session_state.test_agent_call["selected_stage"])
+        stats = list(app.session_state.test_stat_questions.values())
+        self.assertEqual("조립하기", stats[-1]["step_title"])
+        self.assertEqual("문제 원인 및 해결", stats[-1]["question_type"])
+
+        next(item for item in app.checkbox if item.key == "specify_stage_1").check().run()
         self.assertEqual("1단계. 만들기", app.selectbox[0].value)
         self.assertEqual("1-1. 자르기", app.selectbox[1].value)
         app.selectbox[1].select("1-2. 조립하기").run()
+        app.chat_input[0].upload("truss.jpg", test_image_bytes(), "image/jpeg").run()
+        self.assertEqual("조립하기", app.session_state.test_agent_call["selected_stage"]["step_title"])
+        self.assertEqual("검사하기", app.session_state.detected_stage_1["step_title"])
+        self.assertTrue(app.session_state.stage_conflict_1)
+        conflict_stat = list(app.session_state.test_stat_questions.values())[-1]
+        self.assertIsNone(conflict_stat["stage_title"])
+        self.assertIsNone(conflict_stat["step_title"])
+        self.assertTrue(any("단계를 확정하지 않고" in item.value for item in app.warning))
+
         app.chat_input[0].set_value("왜 흔들리나요?").run()
-        self.assertEqual("조립하기", app.session_state.test_agent_call["stage"]["step_title"])
-        self.assertEqual(2, len(app.session_state.messages))
+        self.assertEqual("조립하기", app.session_state.test_agent_call["selected_stage"]["step_title"])
+        self.assertFalse(app.session_state.stage_conflict_1)
+        self.assertEqual(6, len(app.session_state.messages))
         app.selectbox[0].select("2단계. 마무리").run()
         self.assertEqual("2-1. 검사하기", app.selectbox[1].value)
         app.chat_input[0].set_value("어디를 봐야 하나요?").run()
-        self.assertEqual("마무리", app.session_state.test_agent_call["stage"]["stage_title"])
-        self.assertEqual("검사하기", app.session_state.test_agent_call["stage"]["step_title"])
-        self.assertEqual(4, len(app.session_state.messages))
+        self.assertEqual("마무리", app.session_state.test_agent_call["selected_stage"]["stage_title"])
+        self.assertEqual("검사하기", app.session_state.test_agent_call["selected_stage"]["step_title"])
+        self.assertEqual(8, len(app.session_state.messages))
         stats = list(app.session_state.test_stat_questions.values())
-        self.assertEqual(2, len(stats))
+        self.assertEqual(4, len(stats))
         self.assertEqual(3, stats[-1]["stage_plan_version"])
         self.assertEqual("마무리", stats[-1]["stage_title"])
         self.assertNotIn("question", stats[-1])
         learning_session = app.session_state.learning_session_id
         self._button_label(app, "새 대화 시작").click().run()
         self.assertEqual(learning_session, app.session_state.learning_session_id)
+        self.assertNotIn("detected_stage_1", app.session_state)
         self.assertEqual(1, len(app.session_state.test_stat_sessions))
 
         self._button(app, "return_to_practices").click().run()
@@ -349,6 +427,7 @@ class StudentAppTest(unittest.TestCase):
 
         app.chat_input[0].upload("work.jpg", image, "image/jpeg").run()
         self.assertTrue(app.session_state.test_agent_call["has_image"])
+        self.assertIsNone(app.session_state.test_agent_call["selected_stage"])
         self.assertEqual("이 사진에서 확인할 점을 알고 싶어요.", app.session_state.test_agent_call["question"])
         self.assertEqual(2, len(app.session_state.messages))
         app.run()

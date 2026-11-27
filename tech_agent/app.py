@@ -7,7 +7,9 @@ from pathlib import Path
 import streamlit as st
 from agents import SQLiteSession
 
-from agent_service import ask_agent, create_agent
+from agent_service import (
+    ask_agent, create_agent, resolve_stage, validated_question_type,
+)
 from database import (
     create_learning_session, get_student_practice_data, init_db, list_published_practices,
     mark_learning_safety, record_learning_question,
@@ -35,6 +37,8 @@ def reset_conversation(practice_id, reset_learning_session=False):
     st.session_state.student_session_id = session_id
     st.session_state.agent_session = SQLiteSession(session_id, str(SESSION_DB))
     st.session_state.messages = []
+    st.session_state.pop(f"detected_stage_{practice_id}", None)
+    st.session_state.pop(f"stage_conflict_{practice_id}", None)
     if reset_learning_session or "learning_session_id" not in st.session_state:
         st.session_state.learning_session_id = f"learning-{practice_id}-{uuid.uuid4().hex}"
         st.session_state.learning_started_at = datetime.now(timezone.utc).isoformat()
@@ -66,7 +70,8 @@ def leave_practice():
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith(("student_safety_check_", "selected_stage_", "selected_step_")):
+        if key.startswith(("student_safety_check_", "selected_stage_", "selected_step_",
+                           "specify_stage_", "detected_stage_", "stage_conflict_")):
             del st.session_state[key]
 
 
@@ -229,6 +234,9 @@ if not st.session_state.practice_started:
 
 stage_key = f"selected_stage_{practice_id}"
 step_key = f"selected_step_{practice_id}"
+specify_stage_key = f"specify_stage_{practice_id}"
+detected_stage_key = f"detected_stage_{practice_id}"
+stage_conflict_key = f"stage_conflict_{practice_id}"
 
 
 def reset_selected_step():
@@ -236,40 +244,39 @@ def reset_selected_step():
 
 
 st.subheader("현재 제작 단계")
-st.caption("실제 작업 상황이 바뀌면 언제든 단계를 다시 선택해도 돼요.")
-stage_options = [
-    f"{index + 1}단계. {stage['title']}"
-    for index, stage in enumerate(student_data["stages"])
-]
-selected_stage_label = st.selectbox(
-    "대단계",
-    options=stage_options,
-    key=stage_key,
-    on_change=reset_selected_step,
-)
-stage_index = stage_options.index(selected_stage_label)
-selected_stage = student_data["stages"][stage_index]
-step_options = [
-    f"{stage_index + 1}-{index + 1}. {step['title']}"
-    for index, step in enumerate(selected_stage["steps"])
-]
-selected_step_label = st.selectbox(
-    "세부 작업",
-    options=step_options,
-    key=step_key,
-)
-step_index = step_options.index(selected_step_label)
-selected_step = selected_stage["steps"][step_index]
-current_stage = {
-    "stage_index": stage_index,
-    "step_index": step_index,
-    "stage_title": selected_stage["title"],
-    "step_title": selected_step["title"],
-    "activity": selected_step["activity"],
-}
-with st.container(border=True):
-    st.markdown(f"**지금 하는 일: {selected_stage['title']} → {selected_step['title']}**")
-    st.write(selected_step["activity"])
+st.caption("단계를 고르지 않고 바로 질문해도 돼요. AI가 질문과 사진을 보고 관련 단계를 파악합니다.")
+current_stage = None
+if st.checkbox("제작 단계 직접 지정 또는 수정", key=specify_stage_key):
+    stage_options = [
+        f"{index + 1}단계. {stage['title']}"
+        for index, stage in enumerate(student_data["stages"])
+    ]
+    selected_stage_label = st.selectbox(
+        "대단계", options=stage_options, key=stage_key, on_change=reset_selected_step,
+    )
+    stage_index = stage_options.index(selected_stage_label)
+    selected_stage = student_data["stages"][stage_index]
+    step_options = [
+        f"{stage_index + 1}-{index + 1}. {step['title']}"
+        for index, step in enumerate(selected_stage["steps"])
+    ]
+    selected_step_label = st.selectbox("세부 작업", options=step_options, key=step_key)
+    step_index = step_options.index(selected_step_label)
+    selected_step = selected_stage["steps"][step_index]
+    current_stage = {
+        "stage_index": stage_index, "step_index": step_index,
+        "stage_title": selected_stage["title"], "step_title": selected_step["title"],
+        "activity": selected_step["activity"],
+    }
+detected_stage = st.session_state.get(detected_stage_key)
+if current_stage:
+    st.info(f"학생 지정 단계: {current_stage['stage_title']} → {current_stage['step_title']}")
+if detected_stage:
+    st.info(f"AI 판단 단계: {detected_stage['stage_title']} → {detected_stage['step_title']}")
+else:
+    st.info("AI 판단 단계: 미분류")
+if st.session_state.get(stage_conflict_key):
+    st.warning("학생 지정 단계와 사진에서 파악한 단계가 다릅니다. 현재 작업 단계를 확인해 주세요.")
 
 stage_tab, safety_tab = st.tabs(["제작 단계", "안전 체크리스트"])
 with stage_tab:
@@ -297,7 +304,12 @@ with st.sidebar:
     st.subheader("현재 실습")
     st.write(practice["title"])
     st.subheader("현재 제작 단계")
-    st.write(f"{selected_stage['title']} → {selected_step['title']}")
+    if detected_stage:
+        st.write(f"AI 판단: {detected_stage['stage_title']} → {detected_stage['step_title']}")
+    elif current_stage:
+        st.write(f"학생 지정: {current_stage['stage_title']} → {current_stage['step_title']}")
+    else:
+        st.write("미분류")
     st.info("위험한 상황에서는 작업을 즉시 멈추고 선생님께 알려 주세요.")
     if st.button("새 대화 시작", use_container_width=True):
         reset_conversation(practice_id)
@@ -344,30 +356,60 @@ if submission:
     with st.chat_message("assistant"):
         with st.spinner("실습 자료를 확인하고 있어요..."):
             response_success = False
+            inferred_stage = None
             try:
-                answer = ask_agent(
-                    agent, display_question, current_stage, st.session_state.agent_session,
-                    image, image_mime_type,
+                turn = ask_agent(
+                    agent, display_question, student_data["stages"],
+                    st.session_state.agent_session, image, image_mime_type,
+                    selected_stage=current_stage,
                 )
             except Exception:
                 logger.exception("학생 AI 응답 처리 실패")
                 st.error("답변을 불러오지 못했어요. 잠시 후 다시 시도하거나 선생님께 알려 주세요.")
             else:
                 response_success = True
+                answer = turn.answer
+                stage_resolution = resolve_stage(
+                    student_data["stages"], turn, selected_stage=current_stage,
+                    has_image=bool(image),
+                )
+                inferred_stage = stage_resolution["inferred"]
+                if inferred_stage:
+                    st.session_state[detected_stage_key] = inferred_stage
+                    st.caption(
+                        f"AI 판단 단계: {inferred_stage['stage_title']} → "
+                        f"{inferred_stage['step_title']}"
+                    )
+                else:
+                    st.session_state.pop(detected_stage_key, None)
+                    st.caption("AI 판단 단계: 미분류")
+                st.session_state[stage_conflict_key] = stage_resolution["conflict"]
+                if stage_resolution["conflict"]:
+                    st.warning(
+                        "학생 지정 단계와 사진에서 파악한 단계가 다릅니다. "
+                        "단계를 확정하지 않고 현재 작업을 확인할게요."
+                    )
                 st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             finally:
+                statistic_stage = (
+                    stage_resolution["confirmed"] if response_success else None
+                )
+                question_type = (
+                    validated_question_type(turn, classify_question(display_question))
+                    if response_success else classify_question(display_question)
+                )
                 record_stat(record_learning_question, {
                     "event_id": event_id,
                     "practice_id": practice_id,
                     "session_id": st.session_state.learning_session_id,
                     "occurred_at": occurred_at,
-                    "stage_index": current_stage["stage_index"],
-                    "stage_title": current_stage["stage_title"],
-                    "step_index": current_stage["step_index"],
-                    "step_title": current_stage["step_title"],
+                    "stage_index": statistic_stage["stage_index"] if statistic_stage else None,
+                    "stage_title": statistic_stage["stage_title"] if statistic_stage else None,
+                    "step_index": statistic_stage["step_index"] if statistic_stage else None,
+                    "step_title": statistic_stage["step_title"] if statistic_stage else None,
                     "stage_plan_version": student_data.get("stage_plan_version"),
-                    "question_type": classify_question(display_question),
+                    "question_type": question_type,
                     "has_image": bool(image),
                     "ai_response_success": response_success,
                 })
