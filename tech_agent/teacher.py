@@ -1,12 +1,16 @@
 """교사용 실습 등록·수정·RAG 자료 관리 화면."""
-import hmac
 import streamlit as st
 
-from agent_service import get_setting
-from database import (
+from auth import AuthenticationError, admin_email, get_setting, verify_id_token
+from firebase_auth_component import firebase_google_auth
+from secure_database import (
     init_db, create_practice, list_practices, get_practice,
     update_practice, set_vector_store, list_practice_files,
     add_practice_file, get_practice_file, remove_practice_file,
+)
+import secure_database
+from teacher_permissions import (
+    add_teacher, authorize, delete_teacher, list_teachers, set_teacher_active,
 )
 from knowledge_service import (
     create_vector_store, upload_and_index, delete_indexed_file,
@@ -15,31 +19,50 @@ from knowledge_service import (
 from publication_ui import render_publication_controls
 
 st.set_page_config(page_title="기술 제작 실습 · 교사 관리", page_icon="🔐", layout="wide")
-init_db()
-
-password = get_setting("TEACHER_PASSWORD")
-if not password:
-    st.error("교사 비밀번호 설정이 없습니다. 서버 관리자에게 문의하세요.")
+firebase_config = {
+    "apiKey": get_setting("FIREBASE_API_KEY"),
+    "authDomain": get_setting("FIREBASE_AUTH_DOMAIN"),
+    "projectId": get_setting("FIREBASE_PROJECT_ID"),
+    "appId": get_setting("FIREBASE_APP_ID"),
+}
+if not admin_email() or not all(firebase_config.values()):
+    st.error("관리자 이메일 또는 Firebase 웹 설정이 누락되어 교사 로그인을 차단했습니다.")
     st.stop()
 
-if not st.session_state.get("teacher_authenticated", False):
-    st.title("🔐 교사 로그인")
-    st.caption("교사 전용 관리 화면입니다.")
-    with st.form("teacher_login"):
-        entered = st.text_input("교사 비밀번호", type="password")
-        submitted = st.form_submit_button("로그인", use_container_width=True)
-    if submitted:
-        if hmac.compare_digest(entered.encode("utf-8"), password.encode("utf-8")):
-            st.session_state.teacher_authenticated = True
+logout_requested = st.session_state.pop("firebase_logout_requested", False)
+result = firebase_google_auth(firebase_config, logout=logout_requested)
+if result and result.get("token"):
+    st.session_state["firebase_id_token"] = result["token"]
+elif result and result.get("token") is None:
+    st.session_state.pop("firebase_id_token", None)
+
+try:
+    identity = verify_id_token(st.session_state.get("firebase_id_token"))
+    actor = authorize(identity)
+except AuthenticationError as exc:
+    st.session_state.pop("firebase_id_token", None)
+    st.title("🔐 교사 Google 로그인")
+    st.warning(str(exc))
+    st.caption("승인된 교사 계정만 접근할 수 있습니다. 위의 Google 로그인 버튼을 사용하세요.")
+    if result and result.get("token"):
+        if st.button("로그아웃"):
+            st.session_state["firebase_logout_requested"] = True
             st.rerun()
-        st.error("비밀번호를 확인해 주세요.")
     st.stop()
+
+secure_database.set_actor(actor)
+init_db()
 
 with st.sidebar:
     st.header("교사 관리")
-    menu = st.radio("메뉴", ["실습 관리", "AI 생성 자료 검토", "익명 통계"])
+    menus = ["실습 관리", "AI 생성 자료 검토", "익명 통계"]
+    if actor["role"] == "admin":
+        menus.append("교사 계정 관리")
+    menu = st.radio("메뉴", menus)
+    st.caption(actor["email"])
     if st.button("로그아웃", use_container_width=True):
-        st.session_state.teacher_authenticated = False
+        st.session_state.pop("firebase_id_token", None)
+        st.session_state["firebase_logout_requested"] = True
         st.rerun()
 
 st.title("📚 기술 제작 실습 · 교사 관리")
@@ -184,7 +207,37 @@ elif menu == "AI 생성 자료 검토":
     with safety_tab:
         render_safety_editor()
 
-else:
+elif menu == "익명 통계":
     from statistics_ui import render_statistics_dashboard
 
     render_statistics_dashboard()
+
+else:
+    st.subheader("👥 교사 계정 관리")
+    with st.form("add_teacher", clear_on_submit=True):
+        teacher_email = st.text_input("교사 Google 이메일")
+        school_id = st.text_input("학교 식별자", help="같은 값을 가진 승인 교사끼리 자료를 공동 관리합니다.")
+        if st.form_submit_button("교사 등록", type="primary"):
+            try:
+                add_teacher(actor, teacher_email, school_id)
+                st.success("교사를 등록했습니다.")
+                st.rerun()
+            except ValueError as exc:
+                st.warning(str(exc))
+    for teacher in list_teachers(actor):
+        email = teacher.get("email", "")
+        with st.container(border=True):
+            st.write(f"**{email}** · {teacher.get('school_id', '-')}")
+            st.caption(f"등록일: {teacher.get('created_at', '-')} · {'활성' if teacher.get('active') else '비활성'}")
+            if st.button("비활성화" if teacher.get("active") else "활성화", key=f"active_{teacher['id']}"):
+                set_teacher_active(actor, email, not teacher.get("active"))
+                st.rerun()
+            confirm_key = f"confirm_teacher_delete_{teacher['id']}"
+            if st.button("권한 삭제", key=f"delete_{teacher['id']}"):
+                st.session_state[confirm_key] = True
+            if st.session_state.get(confirm_key):
+                st.warning("이 교사의 접근 권한을 삭제할까요?")
+                if st.button("삭제 확인", key=f"delete_confirm_{teacher['id']}", type="primary"):
+                    delete_teacher(actor, email)
+                    st.session_state.pop(confirm_key, None)
+                    st.rerun()

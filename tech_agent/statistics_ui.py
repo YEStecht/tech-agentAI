@@ -4,7 +4,7 @@ from datetime import date, timedelta
 
 import streamlit as st
 
-from database import get_learning_statistics, list_practices
+from secure_database import get_learning_statistics, list_practices
 from statistics_service import aggregate_statistics, improvement_notes
 
 

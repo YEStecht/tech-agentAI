@@ -5,7 +5,7 @@ import json
 from openai import OpenAI
 
 from agent_service import get_setting
-from database import get_practice
+from secure_database import get_practice
 
 
 SAFETY_SCHEMA = {

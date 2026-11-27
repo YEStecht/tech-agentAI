@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from database import get_practice, get_publish_requirements, set_practice_published
+from secure_database import get_practice, get_publish_requirements, set_practice_published
 from publication import PracticePublishError
 
 

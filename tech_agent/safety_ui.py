@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from database import (
+from secure_database import (
     get_practice, get_safety_checklist, list_practice_files, list_practices,
     save_safety_checklist,
 )

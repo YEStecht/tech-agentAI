@@ -103,7 +103,7 @@ def _allocate_document(collection_name, counter_field, sqlite_table, fields):
     return _run_transaction(client, operation)
 
 
-def create_practice(title, description=""):
+def create_practice(title, description="", school_id=None):
     title = title.strip()
     if not title:
         raise ValueError("실습명을 입력해야 합니다.")
@@ -116,6 +116,7 @@ def create_practice(title, description=""):
             "description": description.strip(),
             "vector_store_id": None,
             "is_published": False,
+            "school_id": school_id,
             "version": 1,
         },
     )

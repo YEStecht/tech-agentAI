@@ -73,6 +73,9 @@ def init_db():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(practices)")}
+        if "school_id" not in columns:
+            conn.execute("ALTER TABLE practices ADD COLUMN school_id TEXT")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS practice_stage_plans (
                 practice_id INTEGER PRIMARY KEY,
@@ -130,14 +133,14 @@ def init_db():
         """)
 
 
-def create_practice(title, description=""):
+def create_practice(title, description="", school_id=None):
     title = title.strip()
     if not title:
         raise ValueError("실습명을 입력해야 합니다.")
     with closing(get_connection()) as conn, conn:
         cursor = conn.execute(
-            "INSERT INTO practices (title, description) VALUES (?, ?)",
-            (title, description.strip()),
+            "INSERT INTO practices (title, description, school_id) VALUES (?, ?, ?)",
+            (title, description.strip(), school_id),
         )
         return cursor.lastrowid
 
