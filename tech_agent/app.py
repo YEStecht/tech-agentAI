@@ -22,6 +22,24 @@ from statistics_service import classify_question
 
 
 st.set_page_config(page_title="기술 제작 실습 AI 도우미", page_icon="🛠️", layout="centered")
+st.markdown(
+    """
+    <style>
+    .stApp { background: linear-gradient(180deg, #f4fbff 0, #fffdf7 28rem); }
+    .stApp button { min-height: 2.75rem; border-radius: .8rem; white-space: normal; }
+    .stApp input, .stApp textarea { font-size: 1rem; }
+    .stApp p, .stApp li { color: #334155; overflow-wrap: anywhere; }
+    .stApp label { padding-block: .25rem; }
+    .stApp label p { font-size: 1.05rem; line-height: 1.55; }
+    .stApp img { max-width: 100%; height: auto; }
+    @media (max-width: 640px) {
+        .stApp h1 { font-size: 1.8rem; }
+        .stApp h2 { font-size: 1.35rem; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 SESSION_DB = Path(__file__).resolve().parent.parent / ".local_data" / "student_conversations.db"
@@ -75,11 +93,11 @@ def leave_practice():
             del st.session_state[key]
 
 
-st.title("🛠️ 기술 제작 실습 AI 도우미")
-st.caption("교사가 준비한 실습을 선택하고 제작 과정의 문제를 스스로 해결해 보세요.")
+st.title("🛠️ 기술 실습 AI 도우미")
 st.session_state.setdefault("selected_practice_id", None)
 
 if st.session_state.selected_practice_id is None:
+    st.caption("오늘 진행할 실습을 선택하세요.")
     st.subheader("실습 선택")
     try:
         practices = list_published_practices()
@@ -133,9 +151,8 @@ record_stat(
     create_learning_session, practice_id, st.session_state.learning_session_id,
     st.session_state.learning_started_at,
 )
-st.subheader(practice["title"])
-if practice.get("description"):
-    st.write(practice["description"])
+st.subheader(f"📘 {practice['title']}")
+st.caption("안전 점검 · 제작 질문 · AI 자가 진단")
 
 if st.button("← 실습 선택으로 돌아가기", key="return_to_practices"):
     leave_practice()
@@ -145,25 +162,31 @@ if "safety_agent_session" not in st.session_state:
     reset_safety_check(practice_id)
 
 if not st.session_state.safety_complete:
-    st.subheader("1. 안전 체크리스트")
-    checked_count = 0
-    for index, item in enumerate(student_data["safety_items"]):
-        if st.checkbox(
-            item["question"],
-            key=f"student_safety_check_{practice_id}_{index}",
-        ):
-            checked_count += 1
-    total_count = len(student_data["safety_items"])
-    st.write(f"확인 완료: **{checked_count} / {total_count}**")
-    st.progress(checked_count / total_count if total_count else 0)
-    if checked_count < total_count:
-        st.info("모든 안전 항목을 직접 확인해야 AI 안전 점검으로 진행할 수 있어요.")
-        st.stop()
+    st.info("🛡️ 안전 점검 진행 중")
+    if not st.session_state.safety_questions:
+        st.subheader("1. 안전 체크리스트")
+        checked_count = 0
+        for index, item in enumerate(student_data["safety_items"]):
+            if st.checkbox(
+                item["question"],
+                key=f"student_safety_check_{practice_id}_{index}",
+            ):
+                checked_count += 1
+        total_count = len(student_data["safety_items"])
+        st.write(f"확인 완료: **{checked_count} / {total_count}**")
+        st.progress(checked_count / total_count if total_count else 0)
+        if checked_count < total_count:
+            st.info("모든 안전 항목을 직접 확인해야 AI 안전 점검으로 진행할 수 있어요.")
+            st.stop()
 
-    record_stat(
-        mark_learning_safety, st.session_state.learning_session_id,
-        checklist_complete=True,
-    )
+        record_stat(
+            mark_learning_safety, st.session_state.learning_session_id,
+            checklist_complete=True,
+        )
+    else:
+        with st.expander("✅ 완료한 안전 체크리스트 다시 보기"):
+            for index, item in enumerate(student_data["safety_items"], start=1):
+                st.markdown(f"**{index}. {item['question']}**")
 
     st.subheader("2. AI 대화형 안전 점검")
     try:
@@ -204,6 +227,10 @@ if not st.session_state.safety_complete:
             st.error("답변을 확인하지 못했어요. 현재 진행 상태는 그대로 유지됩니다.")
         else:
             st.session_state.safety_messages.extend([
+                {
+                    "role": "assistant",
+                    "content": f"**안전 질문 {question_index + 1}**\n\n{current_question}",
+                },
                 {"role": "user", "content": safety_answer},
                 {
                     "role": "assistant",
@@ -243,54 +270,55 @@ def reset_selected_step():
     st.session_state.pop(step_key, None)
 
 
-st.subheader("현재 제작 단계")
-st.caption("단계를 고르지 않고 바로 질문해도 돼요. AI가 질문과 사진을 보고 관련 단계를 파악합니다.")
 current_stage = None
-if st.checkbox("제작 단계 직접 지정 또는 수정", key=specify_stage_key):
-    stage_options = [
-        f"{index + 1}단계. {stage['title']}"
-        for index, stage in enumerate(student_data["stages"])
-    ]
-    selected_stage_label = st.selectbox(
-        "대단계", options=stage_options, key=stage_key, on_change=reset_selected_step,
-    )
-    stage_index = stage_options.index(selected_stage_label)
-    selected_stage = student_data["stages"][stage_index]
-    step_options = [
-        f"{stage_index + 1}-{index + 1}. {step['title']}"
-        for index, step in enumerate(selected_stage["steps"])
-    ]
-    selected_step_label = st.selectbox("세부 작업", options=step_options, key=step_key)
-    step_index = step_options.index(selected_step_label)
-    selected_step = selected_stage["steps"][step_index]
-    current_stage = {
-        "stage_index": stage_index, "step_index": step_index,
-        "stage_title": selected_stage["title"], "step_title": selected_step["title"],
-        "activity": selected_step["activity"],
-    }
+with st.sidebar:
+    st.subheader("📘 현재 실습")
+    st.write(practice["title"])
+    st.success("✅ 안전 점검 완료")
+    with st.expander("안전 체크리스트 다시 보기"):
+        st.caption("위험할 때는 작업을 멈추고 선생님께 알려 주세요.")
+        for index, item in enumerate(student_data["safety_items"], start=1):
+            st.markdown(f"**✅ {index}. {item['question']}**")
+    with st.expander("✏️ 제작 단계 직접 지정 (선택)"):
+        st.caption("기본은 AI 자동 파악입니다. 필요한 경우에만 직접 지정하세요.")
+        if st.checkbox("제작 단계 직접 지정 또는 수정", key=specify_stage_key):
+            stage_options = [
+                f"{index + 1}단계. {stage['title']}"
+                for index, stage in enumerate(student_data["stages"])
+            ]
+            selected_stage_label = st.selectbox(
+                "대단계", options=stage_options, key=stage_key, on_change=reset_selected_step,
+            )
+            stage_index = stage_options.index(selected_stage_label)
+            selected_stage = student_data["stages"][stage_index]
+            step_options = [
+                f"{stage_index + 1}-{index + 1}. {step['title']}"
+                for index, step in enumerate(selected_stage["steps"])
+            ]
+            selected_step_label = st.selectbox("세부 작업", options=step_options, key=step_key)
+            step_index = step_options.index(selected_step_label)
+            selected_step = selected_stage["steps"][step_index]
+            current_stage = {
+                "stage_index": stage_index, "step_index": step_index,
+                "stage_title": selected_stage["title"], "step_title": selected_step["title"],
+                "activity": selected_step["activity"],
+            }
+    with st.expander("📋 전체 제작 단계 참고"):
+        for stage_index, stage in enumerate(student_data["stages"], start=1):
+            st.markdown(f"**{stage_index}단계. {stage['title']}**")
+            for step_index, step in enumerate(stage["steps"], start=1):
+                st.markdown(f"{stage_index}-{step_index}. **{step['title']}**")
+                st.caption(step["activity"])
+
 detected_stage = st.session_state.get(detected_stage_key)
 if current_stage:
-    st.info(f"학생 지정 단계: {current_stage['stage_title']} → {current_stage['step_title']}")
+    st.caption(f"📍 학생 지정 · {current_stage['stage_title']} → {current_stage['step_title']}")
 if detected_stage:
-    st.info(f"AI 판단 단계: {detected_stage['stage_title']} → {detected_stage['step_title']}")
-else:
-    st.info("AI 판단 단계: 미분류")
+    st.caption(f"📍 AI 판단 · {detected_stage['stage_title']} → {detected_stage['step_title']}")
+elif not current_stage:
+    st.caption("📍 현재 단계 · 질문 후 AI가 자동으로 파악해요")
 if st.session_state.get(stage_conflict_key):
-    st.warning("학생 지정 단계와 사진에서 파악한 단계가 다릅니다. 현재 작업 단계를 확인해 주세요.")
-
-stage_tab, safety_tab = st.tabs(["제작 단계", "안전 체크리스트"])
-with stage_tab:
-    for stage_index, stage in enumerate(student_data["stages"], start=1):
-        with st.expander(f"{stage_index}단계. {stage['title']}"):
-            for step_index, step in enumerate(stage["steps"], start=1):
-                st.markdown(f"**{stage_index}-{step_index}. {step['title']}**")
-                st.write(step["activity"])
-                if step.get("source"):
-                    st.caption(f"자료 근거: {step['source']}")
-with safety_tab:
-    st.caption("체크리스트는 안전을 돕는 자료이며, 위험할 때는 작업을 멈추고 선생님께 알려 주세요.")
-    for index, item in enumerate(student_data["safety_items"], start=1):
-        st.markdown(f"**✅ {index}. {item['question']}**")
+    st.warning("단계가 서로 달라요. 직접 지정한 단계와 사진 속 작업을 확인해 주세요.")
 
 if "agent_session" not in st.session_state:
     reset_conversation(practice_id)
@@ -301,27 +329,23 @@ except ValueError:
     st.stop()
 
 with st.sidebar:
-    st.subheader("현재 실습")
-    st.write(practice["title"])
-    st.subheader("현재 제작 단계")
-    if detected_stage:
-        st.write(f"AI 판단: {detected_stage['stage_title']} → {detected_stage['step_title']}")
-    elif current_stage:
-        st.write(f"학생 지정: {current_stage['stage_title']} → {current_stage['step_title']}")
-    else:
-        st.write("미분류")
     st.info("위험한 상황에서는 작업을 즉시 멈추고 선생님께 알려 주세요.")
-    if st.button("새 대화 시작", use_container_width=True):
-        reset_conversation(practice_id)
-        st.rerun()
+    with st.expander("대화 관리"):
+        st.caption("현재 대화 내용이 모두 지워집니다.")
+        if st.button("새 대화 시작", use_container_width=True):
+            reset_conversation(practice_id)
+            st.rerun()
 
+st.subheader("💬 AI에게 물어보기")
+if not st.session_state.messages:
+    st.info("어려운 점을 글이나 사진으로 알려 주세요. AI가 현재 단계를 함께 파악해요.")
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message.get("has_image"):
             st.caption("📷 사진 첨부됨 (원본은 저장하지 않음)")
 
-st.caption("얼굴, 이름표 등 개인정보가 보이지 않는 제작물 사진만 첨부해 주세요. 원본 사진은 저장하지 않아요.")
+st.caption("📷 얼굴·이름표는 빼고 제작물만 찍어 주세요. 원본 사진은 저장하지 않아요.")
 submission = st.chat_input(
     "어려운 점을 쓰거나 제작물 사진을 첨부해 주세요.",
     accept_file=True,

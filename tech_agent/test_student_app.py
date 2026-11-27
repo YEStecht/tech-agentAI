@@ -270,6 +270,7 @@ class SafetyAgentServiceTest(unittest.TestCase):
         self.assertIn("표현이 달라도 통과", created["instructions"])
         self.assertIn("짧은 힌트", created["instructions"])
         self.assertIn("즉시 작업 중지", created["instructions"])
+        self.assertIn("자연스럽고 짧은 한두 문장", created["instructions"])
 
     def test_structured_questions_and_evaluation_are_validated(self):
         session = object()
@@ -318,12 +319,14 @@ class StudentAppTest(unittest.TestCase):
             checkbox.check()
         app.run()
         self._button_label(app, "AI 안전 점검 시작").click().run()
+        self.assertTrue(any("완료한 안전 체크리스트" in item.label for item in app.expander))
         app.chat_input[0].set_value("오류").run()
         self.assertEqual(0, app.session_state.safety_question_index)
         self.assertTrue(any("진행 상태는 그대로" in item.value for item in app.error))
         app.chat_input[0].set_value("부족").run()
         self.assertEqual(0, app.session_state.safety_question_index)
         self.assertTrue(any("힌트" in item.value for item in app.markdown))
+        self.assertTrue(any("안전 질문 1" in item.value for item in app.markdown))
         app.chat_input[0].set_value("위험").run()
         self.assertEqual(0, app.session_state.safety_question_index)
         self.assertTrue(any("즉시 멈추고" in item.value for item in app.markdown))
@@ -354,7 +357,8 @@ class StudentAppTest(unittest.TestCase):
         self._complete_safety(app)
         self.assertEqual("vs_1", app.session_state.test_vector_store)
         self.assertTrue(app.chat_input[0].proto.accept_file)
-        self.assertTrue(any("만들기" in item.label for item in app.expander))
+        self.assertTrue(any("전체 제작 단계 참고" in item.label for item in app.expander))
+        self.assertFalse(any(item.label.startswith("1단계.") for item in app.expander))
         self.assertTrue(any("도구 사용법" in item.value for item in app.markdown))
 
         self.assertEqual(0, len(app.selectbox))

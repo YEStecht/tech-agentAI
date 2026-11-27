@@ -106,6 +106,10 @@ class SafetyGeneratorTest(unittest.TestCase):
         self.assertIn("한 질문에는 가급적 하나의 안전 점검 내용", prompt)
         self.assertIn("제작 결과만으로", prompt)
         self.assertIn("임의로 가정하지 않는다", prompt)
+        self.assertIn("재료 고정, 기둥 제작", prompt)
+        self.assertIn("아직 만들지 않은 결과물", prompt)
+        self.assertIn("접착제는 환기", prompt)
+        self.assertIn("짧고 구체적인 한 문장", prompt)
 
 
 APP_TEST_SOURCE = r'''
