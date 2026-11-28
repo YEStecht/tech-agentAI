@@ -1,4 +1,6 @@
 """교사용 실습 등록·수정·RAG 자료 관리 화면."""
+from pathlib import Path
+
 import streamlit as st
 
 from auth import AuthenticationError, admin_email, get_setting, verify_id_token
@@ -6,7 +8,7 @@ from firebase_auth_component import firebase_google_auth
 from secure_database import (
     init_db, create_practice, list_practices, get_practice,
     update_practice, set_vector_store, list_practice_files,
-    add_practice_file, get_practice_file, remove_practice_file,
+    add_practice_file, get_practice_file, remove_practice_file, save_material_pages,
 )
 import secure_database
 from teacher_permissions import (
@@ -17,6 +19,7 @@ from knowledge_service import (
     SUPPORTED_EXTENSIONS, MAX_FILE_BYTES,
 )
 from publication_ui import render_publication_controls
+from material_service import render_pdf_pages
 
 st.set_page_config(page_title="기술 제작 실습 · 교사 관리", page_icon="🔐", layout="wide")
 st.markdown(
@@ -138,7 +141,14 @@ if menu == "🧩 실습 관리":
 
     st.divider()
     st.subheader("② 실습 자료 업로드 및 RAG 색인")
-    st.write("PDF, DOCX, PPTX, TXT, MD 파일을 등록하면 이 실습 전용 검색 자료로 색인합니다.")
+    st.info(
+        "PDF 자료를 등록하면 AI 검색과 학생용 시각 자료 표시 기능을 함께 사용할 수 있습니다. "
+        "시각 자료 활용을 위해 PDF 형식을 권장합니다."
+    )
+    st.write(
+        "PPTX도 AI 검색용으로 등록할 수 있습니다. 학생에게 시각 자료가 필요하면 "
+        "등록된 PPTX에 같은 내용의 PDF를 추가로 연결할 수 있습니다."
+    )
     st.caption("파일당 최대 20MB · 이미지로만 된 PDF는 검색되지 않을 수 있어요.")
     upload = st.file_uploader(
         "실습 매뉴얼이나 안전 자료 선택",
@@ -160,7 +170,7 @@ if menu == "🧩 실습 관리":
                 with st.spinner("OpenAI에 업로드하고 검색 색인을 완료하는 중..."):
                     result = upload_and_index(store_id, upload.name, data)
                 try:
-                    add_practice_file(
+                    file_id = add_practice_file(
                         selected_id, upload.name,
                         result["openai_file_id"],
                         result["vector_store_file_id"],
@@ -170,6 +180,11 @@ if menu == "🧩 실습 관리":
                     st.error("원격 색인은 완료됐지만 DB 기록에 실패했습니다. 같은 파일을 다시 올리지 말고 관리자에게 확인해 주세요.")
                     st.code(f"Vector Store: {store_id}\nOpenAI file: {result['openai_file_id']}")
                     st.stop()
+                if Path(upload.name).suffix.lower() == ".pdf":
+                    try:
+                        save_material_pages(file_id, render_pdf_pages(data), upload.name)
+                    except Exception as exc:
+                        st.warning(f"검색 색인은 완료됐지만 페이지 이미지 준비에 실패했습니다: {exc}")
                 st.success(f"'{upload.name}' 파일 색인이 완료됐어요!")
                 st.rerun()
             except Exception as exc:
@@ -188,6 +203,10 @@ if menu == "🧩 실습 관리":
                 with left:
                     st.write(f"**{f['filename']}**")
                     st.caption(f"색인 상태: {f['status']} · 등록: {f['created_at']}")
+                    if f.get("visual_status") == "completed":
+                        st.caption(f"🖼️ 시각 자료 {f.get('page_count', 0)}페이지 준비됨")
+                    else:
+                        st.caption("시각 자료 없음 · 기존 자료는 원본 PDF 재등록이 필요합니다.")
                 with right:
                     if st.button("삭제", key=f"delete_{f['id']}"):
                         st.session_state["confirm_delete_file"] = f["id"]
@@ -214,6 +233,22 @@ if menu == "🧩 실습 관리":
                         if st.button("취소", key=f"cancel_{f['id']}"):
                             st.session_state.pop("confirm_delete_file", None)
                             st.rerun()
+                if f.get("visual_status") != "completed":
+                    visual_pdf = st.file_uploader(
+                        "시각 표시용 PDF (Vector Store에 중복 색인하지 않음)",
+                        type=["pdf"], key=f"visual_pdf_{f['id']}", max_upload_size=20,
+                        help="PPTX는 PowerPoint 없이 안정적으로 표시하기 위해 같은 자료의 PDF를 등록해 주세요.",
+                    )
+                    if visual_pdf is not None and st.button(
+                        "페이지 이미지 준비", key=f"prepare_visual_{f['id']}"
+                    ):
+                        try:
+                            pages = render_pdf_pages(visual_pdf.getvalue())
+                            save_material_pages(f["id"], pages, visual_pdf.name)
+                            st.success("시각 자료 페이지를 준비했습니다.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.warning(f"시각 자료를 준비하지 못했습니다: {exc}")
 
     st.divider()
     from stage_ui import render_stage_editor

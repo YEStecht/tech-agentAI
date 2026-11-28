@@ -27,6 +27,7 @@ LEARNING_QUESTIONS = "anonymous_learning_questions"
 QUESTION_ANSWERS = "learning_question_answers"
 QUESTION_REVIEWS = "teacher_qa_reviews"
 GUIDANCE_INSTRUCTIONS = "practice_guidance_instructions"
+MATERIAL_PAGES = "practice_material_pages"
 __all__ = [
     "get_connection", "init_db", "create_practice", "list_practices", "get_practice",
     "update_practice", "set_vector_store", "list_practice_files", "delete_practice",
@@ -42,6 +43,7 @@ __all__ = [
     "list_guidance_instructions", "save_guidance_instruction",
     "delete_guidance_instruction", "get_active_guidance_instructions",
     "get_relevant_improvement_cases",
+    "save_material_pages", "get_student_material_catalog", "get_student_material_page",
 ]
 
 
@@ -220,6 +222,9 @@ def add_practice_file(
             "openai_file_id": openai_file_id,
             "vector_store_file_id": vector_store_file_id,
             "status": status,
+            "visual_status": "unavailable",
+            "page_count": 0,
+            "visual_source_filename": None,
         },
     )
 
@@ -236,10 +241,63 @@ def remove_practice_file(file_id):
     def operation(transaction):
         if not reference.get(transaction=transaction).exists:
             return False
+        pages = [
+            page for page in client.collection(MATERIAL_PAGES).where(
+                "file_id", "==", int(file_id)
+            ).stream(transaction=transaction)
+        ]
+        for page in pages:
+            transaction.delete(client.collection(MATERIAL_PAGES).document(page.id))
         transaction.delete(reference)
         return True
 
     return _run_transaction(client, operation)
+
+
+def save_material_pages(file_id, pages, source_filename):
+    client = get_firestore_client()
+    file_ref = client.collection(PRACTICE_FILES).document(str(file_id))
+    if not file_ref.get().exists:
+        raise ValueError("등록된 실습 자료를 찾을 수 없습니다.")
+    for snapshot in client.collection(MATERIAL_PAGES).where(
+        "file_id", "==", int(file_id)
+    ).stream():
+        client.collection(MATERIAL_PAGES).document(snapshot.id).delete()
+    for item in pages:
+        client.collection(MATERIAL_PAGES).document(
+            f"{file_id}-{item['page_number']}"
+        ).set({**item, "file_id": int(file_id)})
+    file_ref.set({
+        "visual_status": "completed", "page_count": len(pages),
+        "visual_source_filename": source_filename,
+    }, merge=True)
+
+
+def get_student_material_catalog(practice_id):
+    practice = get_practice(practice_id)
+    if not practice or not practice.get("is_published"):
+        return []
+    return [{
+        "file_id": item["id"], "filename": item["filename"],
+        "visual_source_filename": item.get("visual_source_filename"),
+        "page_count": int(item.get("page_count", 0)),
+    } for item in list_practice_files(practice_id)
+      if item.get("visual_status") == "completed" and int(item.get("page_count", 0)) > 0]
+
+
+def get_student_material_page(practice_id, file_id, page_number):
+    practice = get_practice(practice_id)
+    file = get_practice_file(file_id)
+    if not practice or not practice.get("is_published") or not file \
+            or int(file.get("practice_id")) != int(practice_id):
+        return None
+    snapshot = get_firestore_client().collection(MATERIAL_PAGES).document(
+        f"{file_id}-{page_number}"
+    ).get()
+    if not snapshot.exists:
+        return None
+    return {**snapshot.to_dict(), "filename": file["filename"],
+            "visual_source_filename": file.get("visual_source_filename")}
 
 
 def _stage_plan_ref(client, practice_id):

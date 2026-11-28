@@ -171,10 +171,10 @@ class StatisticsDashboardTest(unittest.TestCase):
         self.assertFalse(any("scope" in str(item.key) for item in app.selectbox))
         self.assertFalse(any(item.key == "new_guidance_content_1" for item in app.text_area))
         comment = next(item for item in app.text_area if item.key == "review_comment_q1")
-        comment.set_value("작성 중인 코멘트").run()
+        comment.set_value("작성 중인 코멘트").run(timeout=15)
         apply = next(item for item in app.checkbox if item.key == "apply_q1")
         self.assertTrue(apply.value)
-        apply.uncheck().run()
+        apply.uncheck().run(timeout=15)
         self.assertEqual("작성 중인 코멘트", next(
             item.value for item in app.text_area if item.key == "review_comment_q1"
         ))

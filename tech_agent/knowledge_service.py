@@ -5,6 +5,7 @@ import io
 import re
 from pathlib import Path
 
+import pypdfium2 as pdfium
 from docx import Document
 from openai import OpenAI
 from pptx import Presentation
@@ -57,6 +58,21 @@ def _pptx_text(data: bytes) -> str:
     return "\n\n".join(sections)
 
 
+def _pdf_text(data: bytes) -> str:
+    document = pdfium.PdfDocument(data)
+    try:
+        sections = []
+        for index in range(len(document)):
+            page = document[index]
+            text_page = page.get_textpage()
+            sections.append(f"## 페이지 {index + 1}\n{text_page.get_text_range().strip()}")
+            text_page.close()
+            page.close()
+        return "\n\n".join(sections)
+    finally:
+        document.close()
+
+
 def prepare_file(filename: str, data: bytes) -> tuple[str, bytes]:
     """검색에 사용할 파일명과 내용을 반환한다. 원본 파일은 별도 보관하지 않는다."""
     safe_name = _safe_name(filename)
@@ -65,15 +81,14 @@ def prepare_file(filename: str, data: bytes) -> tuple[str, bytes]:
         raise ValueError("PDF, DOCX, PPTX, TXT, MD 파일만 업로드할 수 있습니다.")
     if not data or len(data) > MAX_FILE_BYTES:
         raise ValueError("파일은 비어 있지 않아야 하며 20MB 이하여야 합니다.")
-    if ext == ".docx":
+    if ext == ".pdf":
+        content = _pdf_text(data)
+    elif ext == ".docx":
         content = _docx_text(data)
     elif ext == ".pptx":
         content = _pptx_text(data)
     elif ext in {".txt", ".md"}:
         content = data.decode("utf-8-sig")
-    else:
-        return safe_name, data
-
     if not content.strip():
         raise ValueError("문서에서 검색 가능한 텍스트를 찾지 못했습니다.")
     return f"{Path(safe_name).stem}.md", content.encode("utf-8")

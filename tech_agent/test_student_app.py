@@ -22,6 +22,7 @@ def test_image_bytes():
 
 APP_SOURCE = r'''
 from pathlib import Path
+import base64
 import agents
 import database
 import agent_service
@@ -34,6 +35,7 @@ st.session_state.setdefault("test_stat_questions", {})
 st.session_state.setdefault("test_qa_records", {})
 st.session_state.setdefault("test_stat_failure", False)
 st.session_state.setdefault("test_guidance_failure", False)
+st.session_state.setdefault("test_material_failure", False)
 
 PRACTICES = {
     1: {"id": 1, "title": "공개 실습 A", "description": "설명 A", "is_published": 1, "vector_store_id": "vs_1"},
@@ -120,12 +122,25 @@ def get_guidance(practice_id, question, conversation_context="", stage_title=Non
         "teacher_guidance": "접착면과 고정 상태를 먼저 확인하게 한다.",
     }]
 database.get_relevant_improvement_cases = get_guidance
+database.get_student_material_catalog = lambda practice_id: [{
+    "file_id": 7, "filename": "guide.pdf", "visual_source_filename": "guide.pdf",
+    "page_count": 2,
+}]
+def get_material_page(practice_id, file_id, page_number):
+    if st.session_state.test_material_failure:
+        raise RuntimeError("mock material failure")
+    return ({
+        "image_bytes": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), "filename": "guide.pdf",
+        "visual_source_filename": "guide.pdf", "page_number": page_number,
+    } if practice_id == 1 and file_id == 7 and page_number == 2 else None)
+database.get_student_material_page = get_material_page
 agents.SQLiteSession = FakeSession
 agent_service.create_agent = lambda vector_store_id: st.session_state.__setitem__("test_vector_store", vector_store_id) or object()
-def ask_agent(agent, question, stages, session, image=None, image_mime_type=None, selected_stage=None, guidance=None):
+def ask_agent(agent, question, stages, session, image=None, image_mime_type=None, selected_stage=None, guidance=None, material_catalog=None):
     st.session_state.test_agent_call = {
         "question": question, "stages": stages, "selected_stage": selected_stage, "session": session,
-        "has_image": image is not None, "image_mime_type": image_mime_type, "guidance": guidance,
+        "has_image": image is not None, "image_mime_type": image_mime_type,
+        "guidance": guidance, "material_catalog": material_catalog,
     }
     if question == "AI 오류":
         raise RuntimeError("mock agent failure")
@@ -143,6 +158,7 @@ def ask_agent(agent, question, stages, session, image=None, image_mime_type=None
         stage_conflict=conflict,
         question_type="문제 원인 및 해결" if "왜" in question else "기타",
         keywords=["조립", "흔들림"],
+        material_references=[{"file_id": 7, "page_number": 2}, {"file_id": 999, "page_number": 1}],
     )
 agent_service.ask_agent = ask_agent
 safety_agent_service.create_safety_agent = lambda vector_store_id, items: object()
@@ -249,7 +265,14 @@ class AgentServiceTest(unittest.TestCase):
         self.assertIsNone(agent_service.resolve_stage(stages, invalid, has_image=True)["confirmed"])
         self.assertEqual("기타", agent_service.validated_question_type(invalid, "기타"))
         self.assertEqual(["조립", "접착"], agent_service.validated_keywords(valid))
-        self.assertIn("내부 기록용이며 answer에 노출하지 않는다", agent_service.INSTRUCTIONS)
+        self.assertIn("material_references는 내부 기록용이며 answer에 노출하지 않는다", agent_service.INSTRUCTIONS)
+        self.assertIn("친근한 반말로 핵심부터", agent_service.INSTRUCTIONS)
+        self.assertIn("일반 제작 질문은 2~3개의 짧은 문장", agent_service.INSTRUCTIONS)
+        self.assertIn("일반적인 재료·도구 지식도", agent_service.INSTRUCTIONS)
+        self.assertIn("자료에 없는 실습별 치수, 수량, 재료 조건은 지어내지 않는다", agent_service.INSTRUCTIONS)
+        self.assertIn("학생 답변이 필요한 확인 질문을 했으면 거기서 답변을 끝내고", agent_service.INSTRUCTIONS)
+        self.assertIn("같은 재료나 제작 단계가 나온다는 이유만으로 고르지 않는다", agent_service.INSTRUCTIONS)
+        self.assertIn("기본은 1페이지", agent_service.INSTRUCTIONS)
 
     def test_new_evidence_can_replace_a_directly_selected_stage(self):
         stages = [
@@ -411,6 +434,8 @@ class StudentAppTest(unittest.TestCase):
         self.assertEqual(("모의 답변", ["조립", "흔들림"]), (qa["ai_answer"], qa["keywords"]))
         self.assertNotIn("file-", " ".join(item["content"] for item in app.session_state.messages))
         self.assertNotIn("session_id", qa)
+        self.assertEqual(2, app.session_state.messages[-1]["material_references"][0]["page_number"])
+        self.assertTrue(any("관련 실습 자료 보기" in item.label for item in app.expander))
 
         next(item for item in app.checkbox if item.key == "specify_stage_1").check().run()
         self.assertEqual("1단계. 만들기", app.selectbox[0].value)
@@ -505,13 +530,22 @@ class StudentAppTest(unittest.TestCase):
         self.assertTrue(any("모의 답변" in item.value for item in app.markdown))
 
     def test_guidance_lookup_failure_keeps_student_answer_working(self):
-        app = AppTest.from_string(APP_SOURCE).run()
+        app = AppTest.from_string(APP_SOURCE).run(timeout=10)
         self._button(app, "start_practice_1").click().run()
         self._complete_safety(app)
         app.session_state.test_guidance_failure = True
         app.chat_input[0].set_value("어떻게 조립하나요?").run()
         self.assertTrue(any("모의 답변" in item.value for item in app.markdown))
         self.assertEqual([], app.session_state.test_agent_call["guidance"])
+
+    def test_material_image_failure_keeps_text_answer_working(self):
+        app = AppTest.from_string(APP_SOURCE).run(timeout=10)
+        self._button(app, "start_practice_1").click().run()
+        self._complete_safety(app)
+        app.session_state.test_material_failure = True
+        app.chat_input[0].set_value("어떻게 조립하나요?").run()
+        self.assertTrue(any("모의 답변" in item.value for item in app.markdown))
+        self.assertFalse(any("관련 실습 자료 보기" in item.label for item in app.expander))
 
 
 if __name__ == "__main__":

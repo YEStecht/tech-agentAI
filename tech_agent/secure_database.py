@@ -105,6 +105,13 @@ def remove_practice_file(file_id):
     return False if not item else _call("remove_practice_file", file_id)
 
 
+def save_material_pages(file_id, pages, source_filename):
+    item = get_practice_file(file_id)
+    if not item:
+        raise ValueError("등록된 실습 자료를 찾을 수 없습니다.")
+    return _call("save_material_pages", file_id, pages, source_filename)
+
+
 def save_question_review(practice_id, *args, **kwargs):
     actor = _require_actor()
     _require_practice(practice_id)

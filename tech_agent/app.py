@@ -10,11 +10,13 @@ from agents import SQLiteSession
 
 from agent_service import (
     ask_agent, create_agent, resolve_stage, validated_keywords, validated_question_type,
+    validated_material_references,
 )
 from database import (
     create_learning_session, get_student_practice_data, init_db, list_published_practices,
     mark_learning_safety, record_learning_question, record_question_answer,
     get_relevant_improvement_cases,
+    get_student_material_catalog, get_student_material_page,
 )
 from image_service import prepare_image
 from safety_agent_service import (
@@ -396,6 +398,32 @@ with st.sidebar:
             st.rerun()
 
 st.subheader("💬 AI에게 물어보기")
+
+
+def show_material_references(references):
+    if not references:
+        return
+    available = []
+    for reference in references:
+        try:
+            page = get_student_material_page(
+                practice_id, reference["file_id"], reference["page_number"]
+            )
+        except Exception:
+            logger.exception("관련 실습 자료 이미지 조회 실패")
+            continue
+        if page:
+            available.append((reference, page))
+    if not available:
+        return
+    with st.expander("관련 실습 자료 보기", expanded=False):
+        st.caption("이미지를 탭한 뒤 브라우저 확대 기능이나 손가락 확대를 사용해 봐.")
+        for reference, page in available:
+            name = reference.get("filename") or page.get("visual_source_filename") or page.get("filename")
+            st.markdown(f"**{name} · {reference['page_number']}페이지**")
+            st.image(page["image_bytes"], width="stretch")
+
+
 if not st.session_state.messages:
     st.info("어려운 점을 글이나 사진으로 알려 주세요. AI가 현재 단계를 함께 파악해요.")
 for message in st.session_state.messages:
@@ -403,6 +431,7 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
         if message.get("has_image"):
             st.caption("📷 사진 첨부됨 (원본은 저장하지 않음)")
+        show_material_references(message.get("material_references", []))
 
 st.caption("📷 얼굴·이름표는 빼고 제작물만 찍어 주세요. 원본 사진은 저장하지 않아요.")
 st.caption(
@@ -443,9 +472,15 @@ if submission:
     with st.chat_message("assistant"):
         with st.spinner("실습 자료를 확인하고 있어요..."):
             response_success = False
+            stage_resolution = {"confirmed": None}
             inferred_stage = None
             answer = ""
             record_keywords = []
+            material_catalog = []
+            material_references = []
+            st.session_state.pop(detected_stage_key, None)
+            st.session_state[stage_conflict_key] = False
+            stage_status.caption("📍 AI 판단 · 현재 질문의 단계를 파악하고 있어요")
             try:
                 guidance = []
                 try:
@@ -460,11 +495,16 @@ if submission:
                     )
                 except Exception:
                     logger.exception("답변 개선 사례 조회 실패")
+                try:
+                    material_catalog = get_student_material_catalog(practice_id)
+                except Exception:
+                    logger.exception("시각 자료 목록 조회 실패")
                 turn = ask_agent(
                     agent, display_question, student_data["stages"],
                     st.session_state.agent_session, image, image_mime_type,
                     selected_stage=current_stage,
                     guidance=guidance,
+                    material_catalog=material_catalog,
                 )
             except Exception:
                 logger.exception("학생 AI 응답 처리 실패")
@@ -473,6 +513,7 @@ if submission:
                 response_success = True
                 answer = strip_internal_references(turn.answer)
                 record_keywords = validated_keywords(turn)
+                material_references = validated_material_references(turn, material_catalog)
                 stage_resolution = resolve_stage(
                     student_data["stages"], turn, selected_stage=current_stage,
                     has_image=bool(image),
@@ -498,7 +539,11 @@ if submission:
                         "단계를 확정하지 않고 현재 작업을 확인할게요."
                     )
                 st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                show_material_references(material_references)
+                st.session_state.messages.append({
+                    "role": "assistant", "content": answer,
+                    "material_references": material_references,
+                })
             finally:
                 statistic_stage = (
                     stage_resolution["confirmed"] if response_success else None

@@ -35,6 +35,7 @@ __all__ = [
     "list_guidance_instructions", "save_guidance_instruction",
     "delete_guidance_instruction", "get_active_guidance_instructions",
     "get_relevant_improvement_cases",
+    "save_material_pages", "get_student_material_catalog", "get_student_material_page",
 ]
 
 
@@ -106,6 +107,26 @@ def init_db():
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (practice_id) REFERENCES practices(id) ON DELETE CASCADE
+            )
+        """)
+        file_columns = {row[1] for row in conn.execute("PRAGMA table_info(practice_files)")}
+        for name, definition in (
+            ("visual_status", "TEXT NOT NULL DEFAULT 'unavailable'"),
+            ("page_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("visual_source_filename", "TEXT"),
+        ):
+            if name not in file_columns:
+                conn.execute(f"ALTER TABLE practice_files ADD COLUMN {name} {definition}")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS practice_material_pages (
+                file_id INTEGER NOT NULL,
+                page_number INTEGER NOT NULL,
+                image_bytes BLOB NOT NULL,
+                mime_type TEXT NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                PRIMARY KEY (file_id, page_number),
+                FOREIGN KEY (file_id) REFERENCES practice_files(id) ON DELETE CASCADE
             )
         """)
         conn.execute("""
@@ -285,6 +306,48 @@ def remove_practice_file(file_id):
     with closing(get_connection()) as conn, conn:
         cursor = conn.execute("DELETE FROM practice_files WHERE id = ?", (file_id,))
         return cursor.rowcount > 0
+
+
+def save_material_pages(file_id, pages, source_filename):
+    with closing(get_connection()) as conn, conn:
+        file = conn.execute("SELECT id FROM practice_files WHERE id = ?", (file_id,)).fetchone()
+        if not file:
+            raise ValueError("등록된 실습 자료를 찾을 수 없습니다.")
+        conn.execute("DELETE FROM practice_material_pages WHERE file_id = ?", (file_id,))
+        conn.executemany(
+            "INSERT INTO practice_material_pages "
+            "(file_id, page_number, image_bytes, mime_type, width, height) VALUES (?, ?, ?, ?, ?, ?)",
+            [(file_id, item["page_number"], item["image_bytes"], item["mime_type"],
+              item["width"], item["height"]) for item in pages],
+        )
+        conn.execute(
+            "UPDATE practice_files SET visual_status = 'completed', page_count = ?, "
+            "visual_source_filename = ? WHERE id = ?",
+            (len(pages), source_filename, file_id),
+        )
+
+
+def get_student_material_catalog(practice_id):
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            "SELECT f.id AS file_id, f.filename, f.visual_source_filename, f.page_count "
+            "FROM practice_files f JOIN practices p ON p.id = f.practice_id "
+            "WHERE f.practice_id = ? AND p.is_published = 1 "
+            "AND f.visual_status = 'completed' AND f.page_count > 0 ORDER BY f.id",
+            (int(practice_id),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_student_material_page(practice_id, file_id, page_number):
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT mp.*, f.filename, f.visual_source_filename FROM practice_material_pages mp "
+            "JOIN practice_files f ON f.id = mp.file_id JOIN practices p ON p.id = f.practice_id "
+            "WHERE p.is_published = 1 AND f.practice_id = ? AND f.id = ? AND mp.page_number = ?",
+            (int(practice_id), int(file_id), int(page_number)),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def get_stage_plan(practice_id):
