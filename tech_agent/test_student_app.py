@@ -56,7 +56,21 @@ def get_student_data(practice_id):
                 {"title": "검사하기", "activity": "완성 상태를 확인한다.", "source": "자료 1"},
             ]},
         ],
-        "safety_items": [{"question": "도구 사용법을 확인했나요?", "origin": "source", "source": "자료 2"}],
+        "safety_items": ([
+            {
+                "question": "보안경을 착용해야 하나요?", "question_type": "yes_no",
+                "options": ["예", "아니오"], "answer": 0,
+                "explanation": "보안경은 눈을 보호합니다.", "origin": "source", "source": "자료 2",
+            },
+            {
+                "question": "도구가 고장 나면 어떻게 해야 하나요?", "question_type": "multiple_choice",
+                "options": ["계속 쓴다", "교사에게 알린다", "친구에게 준다"], "answer": 1,
+                "explanation": "사용을 멈추고 교사에게 알려야 합니다.",
+                "origin": "ai_suggested", "source": "",
+            },
+        ] if practice_id == 1 else [
+            {"question": "도구 사용법을 확인했나요?", "origin": "source", "source": "자료 2"}
+        ]),
         "vector_store_id": PRACTICES[practice_id]["vector_store_id"],
         "stage_plan_version": 3,
     }
@@ -315,26 +329,22 @@ class StudentAppTest(unittest.TestCase):
         return next(button for button in app.button if button.label == label)
 
     def _complete_safety(self, app):
-        for checkbox in app.checkbox:
-            checkbox.check()
-        app.run()
-        self._button_label(app, "AI 안전 점검 시작").click().run()
-        self.assertTrue(any("완료한 안전 체크리스트" in item.label for item in app.expander))
-        app.chat_input[0].set_value("오류").run()
+        first_order = list(app.session_state.safety_option_orders[0])
+        self.assertCountEqual(["예", "아니오"], first_order)
+        self._button_label(app, "아니오").click().run()
         self.assertEqual(0, app.session_state.safety_question_index)
-        self.assertTrue(any("진행 상태는 그대로" in item.value for item in app.error))
-        app.chat_input[0].set_value("부족").run()
-        self.assertEqual(0, app.session_state.safety_question_index)
-        self.assertTrue(any("힌트" in item.value for item in app.markdown))
-        self.assertTrue(any("안전 질문 1" in item.value for item in app.markdown))
-        app.chat_input[0].set_value("위험").run()
-        self.assertEqual(0, app.session_state.safety_question_index)
-        self.assertTrue(any("즉시 멈추고" in item.value for item in app.markdown))
-        app.chat_input[0].set_value("안전한 행동을 설명합니다").run()
+        self.assertEqual(first_order, list(app.session_state.safety_option_orders[0]))
+        self.assertTrue(any("다시 선택" in item.value for item in app.error))
+        app.run(timeout=10)
+        self.assertEqual(first_order, list(app.session_state.safety_option_orders[0]))
+        self._button_label(app, "예").click().run()
+        self.assertTrue(any("정답입니다" in item.value for item in app.success))
+        self._button_label(app, "다음 문항").click().run()
         self.assertEqual(1, app.session_state.safety_question_index)
-        app.chat_input[0].set_value("두 번째 안전 행동입니다").run()
+        self._button_label(app, "교사에게 알린다").click().run()
+        self._button_label(app, "제작 실습으로 이동").click().run()
         self.assertTrue(app.session_state.safety_complete)
-        self._button_label(app, "제작 실습 시작").click().run()
+        self.assertTrue(app.session_state.practice_started)
         return app
 
     def test_selection_data_session_switch_and_private_access_block(self):
@@ -351,7 +361,7 @@ class StudentAppTest(unittest.TestCase):
         self.assertTrue(first_safety_session.startswith("safety-1-"))
         self.assertNotEqual(first_session, first_safety_session)
         self.assertEqual(0, len(app.chat_input))
-        self.assertTrue(any("모든 안전 항목" in item.value for item in app.info))
+        self.assertTrue(any("보안경을 착용" in item.value for item in app.subheader))
         self.assertFalse(any("자료 근거" in item.value for item in app.caption))
 
         self._complete_safety(app)
@@ -359,7 +369,7 @@ class StudentAppTest(unittest.TestCase):
         self.assertTrue(app.chat_input[0].proto.accept_file)
         self.assertTrue(any("전체 제작 단계 참고" in item.label for item in app.expander))
         self.assertFalse(any(item.label.startswith("1단계.") for item in app.expander))
-        self.assertTrue(any("도구 사용법" in item.value for item in app.markdown))
+        self.assertTrue(any("보안경을 착용" in item.value for item in app.markdown))
 
         self.assertEqual(0, len(app.selectbox))
         app.chat_input[0].set_value("왜 조립한 부분이 흔들리나요?").run()
@@ -411,6 +421,8 @@ class StudentAppTest(unittest.TestCase):
         self.assertEqual([], app.session_state.safety_questions)
         self.assertEqual([], app.session_state.messages)
         self.assertEqual(2, len(app.session_state.test_stat_sessions))
+        self.assertTrue(any(item.key == "student_safety_check_2_0" for item in app.checkbox))
+        self.assertTrue(any("모든 안전 항목" in item.value for item in app.info))
 
         app.session_state.test_public = {1: True, 2: False, 3: False}
         app.run()
@@ -420,7 +432,7 @@ class StudentAppTest(unittest.TestCase):
     def test_no_published_practices(self):
         app = AppTest.from_string(APP_SOURCE)
         app.session_state.test_public = {1: False, 2: False, 3: False}
-        app.run()
+        app.run(timeout=10)
         self.assertTrue(any("공개 실습이 없어요" in item.value for item in app.info))
 
     def test_photo_only_combined_cancel_invalid_and_agent_failure(self):

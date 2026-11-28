@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from image_service import prepare_image
 from safety_agent_service import (
     create_safety_agent, evaluate_safety_answer, generate_safety_questions,
 )
+from safety_editor import is_choice_checklist, is_correct_choice
 from statistics_service import classify_question
 
 
@@ -73,6 +75,8 @@ def reset_safety_check(practice_id):
     st.session_state.safety_questions = []
     st.session_state.safety_question_index = 0
     st.session_state.safety_messages = []
+    st.session_state.safety_feedback = None
+    st.session_state.safety_option_orders = {}
     st.session_state.safety_complete = False
     st.session_state.practice_started = False
 
@@ -83,6 +87,8 @@ def leave_practice():
         "student_session_id", "agent_session", "messages", "safety_session_id",
         "safety_agent_session", "safety_questions", "safety_question_index",
         "safety_messages", "safety_complete", "practice_started",
+        "safety_feedback",
+        "safety_option_orders",
         "learning_started_at",
         "learning_session_id",
     ):
@@ -163,6 +169,57 @@ if "safety_agent_session" not in st.session_state:
 
 if not st.session_state.safety_complete:
     st.info("🛡️ 안전 점검 진행 중")
+    if is_choice_checklist(student_data["safety_items"]):
+        items = student_data["safety_items"]
+        question_index = st.session_state.safety_question_index
+        current = items[question_index]
+        option_order = st.session_state.safety_option_orders.setdefault(
+            question_index,
+            random.sample(current["options"], k=len(current["options"])),
+        )
+        st.caption(f"안전 문항 {question_index + 1} / {len(items)}")
+        st.progress(question_index / len(items))
+        st.subheader(current["question"])
+        st.caption(
+            "이 점검의 통과가 실제 안전이나 도구 사용 허가를 의미하지 않습니다. "
+            "위험한 도구는 반드시 선생님의 지도와 확인을 받아 사용하세요."
+        )
+
+        feedback = st.session_state.safety_feedback
+        if feedback and feedback["question_index"] == question_index:
+            if feedback["correct"]:
+                st.success(f"정답입니다. {current['explanation']}")
+                if st.button(
+                    "제작 실습으로 이동" if question_index == len(items) - 1 else "다음 문항",
+                    type="primary", use_container_width=True,
+                ):
+                    st.session_state.safety_question_index += 1
+                    st.session_state.safety_feedback = None
+                    if st.session_state.safety_question_index == len(items):
+                        st.session_state.safety_complete = True
+                        st.session_state.practice_started = True
+                        record_stat(
+                            mark_learning_safety, st.session_state.learning_session_id,
+                            checklist_complete=True, ai_complete=True,
+                        )
+                    st.rerun()
+            else:
+                st.error(f"다시 선택해 보세요. {current['explanation']}")
+
+        if not feedback or not feedback["correct"]:
+            for option_index, option in enumerate(option_order):
+                if st.button(
+                    option,
+                    key=f"safety_choice_{practice_id}_{question_index}_{option_index}",
+                    use_container_width=True,
+                ):
+                    st.session_state.safety_feedback = {
+                        "question_index": question_index,
+                        "correct": is_correct_choice(current, option),
+                    }
+                    st.rerun()
+        st.stop()
+
     if not st.session_state.safety_questions:
         st.subheader("1. 안전 체크리스트")
         checked_count = 0

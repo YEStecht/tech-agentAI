@@ -8,7 +8,7 @@ import sqlite_database
 from firebase_client import get_firestore_client
 from stage_editor import StagePlanConflictError, cleaned_stages, validate_stages
 from safety_editor import (
-    SafetyChecklistConflictError, cleaned_items, validate_items,
+    SafetyChecklistConflictError, cleaned_items, is_choice_checklist, validate_items,
 )
 from publication import publication_requirements, require_publishable
 
@@ -409,7 +409,7 @@ def save_safety_checklist(practice_id, items, expected_version=None):
         transaction.set(
             reference,
             {
-                "schema_version": 1,
+                "schema_version": 2 if is_choice_checklist(normalized) else 1,
                 "items": normalized,
                 "version": version,
                 "updated_at": firestore.SERVER_TIMESTAMP,

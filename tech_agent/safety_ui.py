@@ -18,11 +18,27 @@ ORIGIN_LABELS = {
     "ai_suggested": "AI 추가 제안",
     "teacher_added": "교사 직접 추가",
 }
+QUESTION_TYPE_LABELS = {"yes_no": "예·아니오형", "multiple_choice": "객관식"}
+
+
+def _editable_items(items):
+    result = cleaned_items(items)
+    for item in result:
+        if "question_type" not in item:
+            item.update({
+                "question_type": "yes_no", "options": ["예", "아니오"],
+                "answer": 0, "explanation": "",
+            })
+    return result
 
 
 def _clear_safety_widget_keys(state, practice_id):
     prefixes = (
         f"safety_question_{practice_id}_",
+        f"safety_question_type_{practice_id}_",
+        f"safety_options_{practice_id}_",
+        f"safety_answer_{practice_id}_",
+        f"safety_explanation_{practice_id}_",
         f"safety_origin_{practice_id}_",
         f"safety_source_{practice_id}_",
     )
@@ -32,7 +48,7 @@ def _clear_safety_widget_keys(state, practice_id):
 
 
 def render_safety_editor():
-    st.subheader("🦺 AI 안전 체크리스트 검토 및 저장")
+    st.subheader("🦺 AI 선택형 안전 문항 검토 및 저장")
     notice = st.session_state.pop("safety_editor_notice", None)
     if notice:
         st.success(notice)
@@ -44,7 +60,7 @@ def render_safety_editor():
 
     options = {item["id"]: f"#{item['id']} · {item['title']}" for item in practices}
     practice_id = st.selectbox(
-        "안전 체크리스트를 관리할 실습",
+        "안전 문항을 관리할 실습",
         options=list(options),
         format_func=lambda value: options[value],
         key="safety_practice_select",
@@ -65,7 +81,8 @@ def render_safety_editor():
         st.error("저장된 안전 체크리스트를 불러오지 못했습니다.")
         st.caption(f"오류 내용: {exc}")
     if practice_id not in drafts and saved:
-        drafts[practice_id] = {"items": cleaned_items(saved["items"])}
+        legacy = any("question_type" not in item for item in saved["items"])
+        drafts[practice_id] = {"items": _editable_items(saved["items"]), "legacy": legacy}
         versions[practice_id] = versions.get(practice_id, 0) + 1
         saved_versions[practice_id] = saved["version"]
         dirty[practice_id] = False
@@ -76,10 +93,24 @@ def render_safety_editor():
         changed = False
         version = versions.get(practice_id, 0)
         for index, item in enumerate(drafts[practice_id]["items"]):
-            for field in ("question", "origin", "source"):
+            for field in ("question", "question_type", "explanation", "origin", "source"):
                 key = f"safety_{field}_{practice_id}_{version}_{index}"
                 if key in st.session_state and item[field] != st.session_state[key]:
                     item[field] = st.session_state[key]
+                    changed = True
+            answer_key = (
+                f"safety_answer_{practice_id}_{version}_{index}_{item['question_type']}"
+            )
+            if answer_key in st.session_state and item["answer"] != st.session_state[answer_key]:
+                item["answer"] = st.session_state[answer_key]
+                changed = True
+            options_key = f"safety_options_{practice_id}_{version}_{index}"
+            if options_key in st.session_state:
+                options = [line.strip() for line in st.session_state[options_key].splitlines()]
+                if item["question_type"] == "yes_no":
+                    options = ["예", "아니오"]
+                if item["options"] != options:
+                    item["options"] = options
                     changed = True
         if changed:
             dirty[practice_id] = True
@@ -91,15 +122,15 @@ def render_safety_editor():
 
     def generate_new():
         try:
-            with st.spinner("실습 자료를 검색하고 안전 체크리스트를 작성하는 중..."):
+            with st.spinner("실습 자료를 검색하고 AI 안전 문항을 작성하는 중..."):
                 generated = generate_safety_checklist(practice_id)
             _clear_safety_widget_keys(st.session_state, practice_id)
-            drafts[practice_id] = generated
+            drafts[practice_id] = {"items": _editable_items(generated["items"]), "legacy": False}
             versions[practice_id] = versions.get(practice_id, 0) + 1
             dirty[practice_id] = True
             pending_delete.pop(practice_id, None)
             pending_replace.pop(practice_id, None)
-            st.session_state["safety_editor_notice"] = "AI 안전 체크리스트를 생성했습니다."
+            st.session_state["safety_editor_notice"] = "AI 안전 문항을 생성했습니다."
             st.rerun()
         except Exception as exc:
             st.error("AI 생성에 실패했습니다. 기존 편집 내용은 유지됩니다.")
@@ -116,7 +147,8 @@ def render_safety_editor():
             st.warning("저장된 안전 체크리스트가 없습니다.")
             return
         _clear_safety_widget_keys(st.session_state, practice_id)
-        drafts[practice_id] = {"items": cleaned_items(latest["items"])}
+        legacy = any("question_type" not in item for item in latest["items"])
+        drafts[practice_id] = {"items": _editable_items(latest["items"]), "legacy": legacy}
         saved_versions[practice_id] = latest["version"]
         dirty[practice_id] = False
         pending_delete.pop(practice_id, None)
@@ -131,8 +163,8 @@ def render_safety_editor():
         st.warning("이 실습에는 RAG 자료가 없습니다.")
     else:
         generate_label = (
-            "✨ AI 안전 체크리스트 다시 생성" if practice_id in drafts
-            else "✨ AI 안전 체크리스트 생성"
+            "✨ AI 안전 문항 다시 생성" if practice_id in drafts
+            else "✨ AI 안전 문항 생성"
         )
         if st.button(generate_label, use_container_width=True):
             if practice_id in drafts:
@@ -152,10 +184,15 @@ def render_safety_editor():
     if practice_id not in drafts:
         return
     items = drafts[practice_id]["items"]
+    if drafts[practice_id].get("legacy"):
+        st.warning(
+            "기존 체크리스트입니다. 질문·정답·해설을 검토해 저장하면 선택형 안전 점검이 적용됩니다. "
+            "저장 전까지 학생은 기존 점검을 계속 사용합니다."
+        )
     version = versions.get(practice_id, 0)
     st.divider()
     metric, status = st.columns([1, 3])
-    metric.metric("안전 점검 항목", f"{len(items)}개")
+    metric.metric("선택형 안전 문항", f"{len(items)}개")
     status.info(
         "● 저장되지 않은 수정 있음"
         if dirty.get(practice_id, False)
@@ -163,7 +200,7 @@ def render_safety_editor():
     )
     save_col, load_col, add_col = st.columns([2, 1, 1])
     with save_col:
-        if st.button("💾 안전 체크리스트 저장", type="primary", use_container_width=True):
+        if st.button("💾 선택형 안전 문항 저장", type="primary", use_container_width=True):
             sync_inputs()
             errors = validate_items(items)
             if errors:
@@ -174,7 +211,7 @@ def render_safety_editor():
                     new_version = save_safety_checklist(
                         practice_id, normalized, saved_versions.get(practice_id)
                     )
-                    drafts[practice_id] = {"items": normalized}
+                    drafts[practice_id] = {"items": normalized, "legacy": False}
                     saved_versions[practice_id] = new_version
                     dirty[practice_id] = False
                     versions[practice_id] = version + 1
@@ -210,8 +247,35 @@ def render_safety_editor():
         label = item["question"] or "새 안전 점검 항목"
         with st.expander(f"{index + 1}. {label}", expanded=(index == 0)):
             item["question"] = st.text_area(
-                "안전 점검 질문 *", value=item["question"], height=90,
+                "질문 *", value=item["question"], height=90,
                 key=f"safety_question_{practice_id}_{version}_{index}",
+            )
+            question_types = list(QUESTION_TYPE_LABELS)
+            item["question_type"] = st.selectbox(
+                "문항 유형 *", question_types, index=question_types.index(item["question_type"]),
+                format_func=lambda value: QUESTION_TYPE_LABELS[value],
+                key=f"safety_question_type_{practice_id}_{version}_{index}",
+            )
+            if item["question_type"] == "yes_no":
+                item["options"] = ["예", "아니오"]
+                st.caption("선택지: 예 / 아니오")
+            else:
+                option_text = st.text_area(
+                    "선택지 * (한 줄에 하나, 2~4개)", value="\n".join(item["options"]),
+                    key=f"safety_options_{practice_id}_{version}_{index}", height=110,
+                )
+                item["options"] = [line.strip() for line in option_text.splitlines()]
+            answer_options = list(range(len(item["options"]))) or [0]
+            if item.get("answer") not in answer_options:
+                item["answer"] = 0
+            item["answer"] = st.selectbox(
+                "정답 *", answer_options, index=answer_options.index(item["answer"]),
+                format_func=lambda value: item["options"][value] if value < len(item["options"]) else "선택지 입력 필요",
+                key=f"safety_answer_{practice_id}_{version}_{index}_{item['question_type']}",
+            )
+            item["explanation"] = st.text_input(
+                "짧은 해설 *", value=item["explanation"],
+                key=f"safety_explanation_{practice_id}_{version}_{index}",
             )
             origins = list(ORIGIN_LABELS)
             item["origin"] = st.selectbox(
