@@ -11,7 +11,7 @@ QUESTION_TYPES = (
 )
 KST = ZoneInfo("Asia/Seoul")
 REVIEW_STATUSES = {"unreviewed", "reviewed"}
-_EMAIL = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_EMAIL = re.compile(r"(?i)(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=$|[^A-Z0-9._%+-])")
 _PHONE = re.compile(r"(?<!\d)(?:01[016789][ -]?\d{3,4}[ -]?\d{4}|0\d{1,2}[ -]?\d{3,4}[ -]?\d{4})(?!\d)")
 _STUDENT_ID = re.compile(r"(?:학번|학생번호)\s*[:：]?\s*[A-Za-z0-9-]+")
 _NAME = re.compile(
@@ -168,7 +168,9 @@ def aggregate_statistics(data):
     return result
 
 
-def filter_question_answers(records, stage="전체", question_type="전체", image="전체", search=""):
+def filter_question_answers(
+    records, stage="전체", question_type="전체", image="전체", search="", review_status="전체",
+):
     search = search.strip().lower()
     result = []
     for item in records:
@@ -177,6 +179,9 @@ def filter_question_answers(records, stage="전체", question_type="전체", ima
         if question_type != "전체" and item.get("question_type") != question_type:
             continue
         if image != "전체" and bool(item.get("has_image")) != (image == "사진 있음"):
+            continue
+        status = item.get("review_status") if item.get("review_status") in REVIEW_STATUSES else "unreviewed"
+        if review_status != "전체" and status != review_status:
             continue
         haystack = " ".join((
             item.get("student_question", ""), item.get("ai_answer", ""),

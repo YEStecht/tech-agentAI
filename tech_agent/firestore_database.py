@@ -1,6 +1,7 @@
 """Cloud Firestore storage for practices and indexed file metadata."""
 
 from datetime import datetime, timezone
+import uuid
 
 from firebase_admin import firestore
 
@@ -12,6 +13,10 @@ from safety_editor import (
 )
 from publication import publication_requirements, require_publishable
 from statistics_service import in_kst_period, is_safe_question_answer_record
+from guidance_service import (
+    GuidanceConflictError, ReviewConflictError, normalized_review_status,
+    safe_teacher_text, select_guidance, select_improvement_cases, validate_scope,
+)
 
 PRACTICES = "practices"
 PRACTICE_FILES = "practice_files"
@@ -20,6 +25,8 @@ COUNTER_DOCUMENT = "practice_data"
 LEARNING_SESSIONS = "anonymous_learning_sessions"
 LEARNING_QUESTIONS = "anonymous_learning_questions"
 QUESTION_ANSWERS = "learning_question_answers"
+QUESTION_REVIEWS = "teacher_qa_reviews"
+GUIDANCE_INSTRUCTIONS = "practice_guidance_instructions"
 __all__ = [
     "get_connection", "init_db", "create_practice", "list_practices", "get_practice",
     "update_practice", "set_vector_store", "list_practice_files", "delete_practice",
@@ -31,6 +38,10 @@ __all__ = [
     "create_learning_session", "mark_learning_safety",
     "record_learning_question", "get_learning_statistics",
     "record_question_answer", "get_question_answers",
+    "save_question_review", "delete_question_review",
+    "list_guidance_instructions", "save_guidance_instruction",
+    "delete_guidance_instruction", "get_active_guidance_instructions",
+    "get_relevant_improvement_cases",
 ]
 
 
@@ -412,13 +423,218 @@ def record_question_answer(record):
 
 
 def get_question_answers(practice_id, start_date, end_date):
+    client = get_firestore_client()
     snapshots = get_firestore_client().collection(QUESTION_ANSWERS).where(
         "practice_id", "==", int(practice_id)
     ).stream()
-    return [
-        item.to_dict() for item in snapshots
-        if in_kst_period(item.to_dict().get("occurred_at"), start_date, end_date)
-    ]
+    result = []
+    for snapshot in snapshots:
+        item = snapshot.to_dict()
+        if not in_kst_period(item.get("occurred_at"), start_date, end_date):
+            continue
+        review_snapshot = client.collection(QUESTION_REVIEWS).document(item["event_id"]).get()
+        review = review_snapshot.to_dict() if review_snapshot.exists else {}
+        guidance_snapshot = (
+            client.collection(GUIDANCE_INSTRUCTIONS).document(review["guidance_id"]).get()
+            if review.get("guidance_id") else None
+        )
+        guidance = guidance_snapshot.to_dict() if guidance_snapshot and guidance_snapshot.exists else {}
+        item.update({
+            "teacher_comment": review.get("comment", ""),
+            "apply_to_ai": bool(review.get("apply_to_ai")),
+            "guidance_id": review.get("guidance_id"),
+            "review_author_email": review.get("author_email"),
+            "review_version": review.get("version"),
+            "review_updated_at": _created_at(review.get("updated_at")),
+            "guidance_scope": guidance.get("scope"),
+            "guidance_stage_title": guidance.get("stage_title"),
+            "guidance_question_type": guidance.get("question_type"),
+            "review_status": normalized_review_status(
+                review.get("review_status", item.get("review_status"))
+            ),
+        })
+        result.append(item)
+    return result
+
+
+def save_question_review(
+    practice_id, event_id, comment, review_status, apply_to_ai, scope,
+    stage_title, question_type, actor, expected_version=None,
+):
+    comment = safe_teacher_text(comment)
+    review_status = normalized_review_status(review_status)
+    if apply_to_ai:
+        if not comment:
+            raise ValueError("AI 답변에 반영하려면 교사 코멘트를 입력해 주세요.")
+        validate_scope(scope, stage_title, question_type)
+    client = get_firestore_client()
+    question_ref = client.collection(QUESTION_ANSWERS).document(event_id)
+    review_ref = client.collection(QUESTION_REVIEWS).document(event_id)
+
+    def operation(transaction):
+        question_snapshot = question_ref.get(transaction=transaction)
+        if not question_snapshot.exists or int(question_snapshot.to_dict().get("practice_id")) != int(practice_id):
+            raise ValueError("질문·답변 기록을 찾을 수 없습니다.")
+        snapshot = review_ref.get(transaction=transaction)
+        current = snapshot.to_dict() if snapshot.exists else {}
+        current_version = int(current["version"]) if snapshot.exists else None
+        if current_version != expected_version:
+            raise ReviewConflictError("다른 교사가 먼저 검토 내용을 변경했습니다.")
+        guidance_id = current.get("guidance_id")
+        if apply_to_ai:
+            guidance_id = guidance_id or f"review-{event_id}"
+            guidance_ref = client.collection(GUIDANCE_INSTRUCTIONS).document(guidance_id)
+            guidance_snapshot = guidance_ref.get(transaction=transaction)
+            guidance_version = int(guidance_snapshot.to_dict().get("version", 0)) if guidance_snapshot.exists else 0
+            transaction.set(guidance_ref, {
+                "id": guidance_id, "practice_id": int(practice_id), "source_event_id": event_id,
+                "content": comment, "scope": scope, "stage_title": stage_title,
+                "question_type": question_type, "active": True, "author_uid": actor["uid"],
+                "author_email": actor["email"], "version": guidance_version + 1,
+                "created_at": guidance_snapshot.to_dict().get("created_at") if guidance_snapshot.exists else firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            })
+        elif guidance_id:
+            guidance_ref = client.collection(GUIDANCE_INSTRUCTIONS).document(guidance_id)
+            guidance_snapshot = guidance_ref.get(transaction=transaction)
+            if guidance_snapshot.exists:
+                transaction.set(guidance_ref, {
+                    "active": False,
+                    "version": int(guidance_snapshot.to_dict().get("version", 0)) + 1,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+        version = (current_version or 0) + 1
+        transaction.set(review_ref, {
+            "event_id": event_id, "practice_id": int(practice_id), "comment": comment,
+            "review_status": review_status, "apply_to_ai": bool(apply_to_ai),
+            "guidance_id": guidance_id, "author_uid": actor["uid"],
+            "author_email": actor["email"], "version": version,
+            "created_at": current.get("created_at", firestore.SERVER_TIMESTAMP),
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        return version
+    return _run_transaction(client, operation)
+
+
+def delete_question_review(practice_id, event_id, actor, expected_version):
+    client = get_firestore_client()
+    review_ref = client.collection(QUESTION_REVIEWS).document(event_id)
+
+    def operation(transaction):
+        snapshot = review_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return False
+        current = snapshot.to_dict()
+        if int(current.get("practice_id")) != int(practice_id):
+            return False
+        if int(current["version"]) != expected_version:
+            raise ReviewConflictError("다른 교사가 먼저 검토 내용을 변경했습니다.")
+        if current.get("guidance_id"):
+            guidance_ref = client.collection(GUIDANCE_INSTRUCTIONS).document(current["guidance_id"])
+            guidance_snapshot = guidance_ref.get(transaction=transaction)
+            if guidance_snapshot.exists:
+                transaction.set(guidance_ref, {
+                    "active": False,
+                    "version": int(guidance_snapshot.to_dict().get("version", 0)) + 1,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+        transaction.delete(review_ref)
+        return True
+    return _run_transaction(client, operation)
+
+
+def list_guidance_instructions(practice_id):
+    snapshots = get_firestore_client().collection(GUIDANCE_INSTRUCTIONS).where(
+        "practice_id", "==", int(practice_id)
+    ).stream()
+    result = []
+    for snapshot in snapshots:
+        item = snapshot.to_dict()
+        item["id"] = item.get("id", snapshot.id)
+        item["active"] = bool(item.get("active"))
+        item["created_at"] = _created_at(item.get("created_at"))
+        item["updated_at"] = _created_at(item.get("updated_at"))
+        if item.get("source_event_id"):
+            source = get_firestore_client().collection(QUESTION_ANSWERS).document(
+                item["source_event_id"]
+            ).get()
+            source_value = source.to_dict() if source.exists else {}
+            item["student_question"] = source_value.get("student_question", "")
+            item["ai_answer"] = source_value.get("ai_answer", "")
+            item["keywords"] = source_value.get("keywords", [])
+            item["stage_title"] = source_value.get("stage_title") or item.get("stage_title")
+            item["question_type"] = source_value.get("question_type") or item.get("question_type")
+        result.append(item)
+    return sorted(result, key=lambda item: str(item.get("updated_at", "")), reverse=True)
+
+
+def save_guidance_instruction(
+    practice_id, instruction_id, content, scope, stage_title, question_type,
+    active, actor, expected_version=None,
+):
+    content = safe_teacher_text(content, required=True)
+    validate_scope(scope, stage_title, question_type)
+    instruction_id = instruction_id or uuid.uuid4().hex
+    client = get_firestore_client()
+    reference = client.collection(GUIDANCE_INSTRUCTIONS).document(instruction_id)
+
+    def operation(transaction):
+        snapshot = reference.get(transaction=transaction)
+        current = snapshot.to_dict() if snapshot.exists else {}
+        if snapshot.exists and int(current.get("practice_id")) != int(practice_id):
+            raise ValueError("지도 지침을 찾을 수 없습니다.")
+        current_version = int(current["version"]) if snapshot.exists else None
+        if current_version != expected_version:
+            raise GuidanceConflictError("다른 교사가 먼저 지도 지침을 변경했습니다.")
+        version = (current_version or 0) + 1
+        transaction.set(reference, {
+            "id": instruction_id, "practice_id": int(practice_id),
+            "source_event_id": current.get("source_event_id"), "content": content,
+            "scope": scope, "stage_title": stage_title, "question_type": question_type,
+            "active": bool(active), "author_uid": actor["uid"], "author_email": actor["email"],
+            "version": version, "created_at": current.get("created_at", firestore.SERVER_TIMESTAMP),
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        return instruction_id, version
+    return _run_transaction(client, operation)
+
+
+def delete_guidance_instruction(practice_id, instruction_id, expected_version):
+    client = get_firestore_client()
+    reference = client.collection(GUIDANCE_INSTRUCTIONS).document(instruction_id)
+
+    def operation(transaction):
+        snapshot = reference.get(transaction=transaction)
+        if not snapshot.exists or int(snapshot.to_dict().get("practice_id")) != int(practice_id):
+            return False
+        if int(snapshot.to_dict()["version"]) != expected_version:
+            raise GuidanceConflictError("다른 교사가 먼저 지도 지침을 변경했습니다.")
+        linked_reviews = [
+            review for review in client.collection(QUESTION_REVIEWS).stream(transaction=transaction)
+            if review.to_dict().get("guidance_id") == instruction_id
+        ]
+        transaction.delete(reference)
+        for review in linked_reviews:
+            transaction.set(client.collection(QUESTION_REVIEWS).document(review.id), {
+                    "apply_to_ai": False, "guidance_id": None,
+                    "version": int(review.to_dict().get("version", 0)) + 1,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+        return True
+    return _run_transaction(client, operation)
+
+
+def get_active_guidance_instructions(practice_id, stage_title=None, question_type=None):
+    return select_guidance(list_guidance_instructions(practice_id), stage_title, question_type)
+
+
+def get_relevant_improvement_cases(
+    practice_id, question, conversation_context="", stage_title=None, question_type=None,
+):
+    return select_improvement_cases(
+        list_guidance_instructions(practice_id), question, conversation_context,
+        stage_title, question_type,
+    )
 
 
 def save_safety_checklist(practice_id, items, expected_version=None):

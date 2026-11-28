@@ -6,6 +6,7 @@ import os
 
 from agents import Agent, FileSearchTool, Runner, SQLiteSession, set_default_openai_key
 from pydantic import BaseModel, Field, ValidationError
+from guidance_service import guidance_context
 
 
 QUESTION_TYPES = {
@@ -125,6 +126,7 @@ def ask_agent(
     agent, question: str, stages: list, session: SQLiteSession,
     image: bytes | None = None, image_mime_type: str | None = None,
     selected_stage: dict | None = None,
+    guidance: list[dict] | None = None,
 ) -> DiagnosisTurn:
     context = (
         "[현재 질문 판단 자료 - 이전 대화의 단계보다 우선]\n"
@@ -133,6 +135,7 @@ def ask_agent(
         f"{json.dumps(selected_stage or {}, ensure_ascii=False)}\n"
         f"사진 첨부 여부: {'있음' if image else '없음'}\n\n"
         f"학생 질문: {question}"
+        f"{guidance_context(guidance or [])}"
     )
     agent_input = context
     run_session = session

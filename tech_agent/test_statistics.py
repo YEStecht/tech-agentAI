@@ -24,6 +24,11 @@ import statistics_ui
 statistics_ui.list_practices = lambda: [{"id": 1, "title": "익명 통계 실습"}]
 statistics_ui.get_learning_statistics = lambda practice_id, start, end: st.session_state.stats_data
 statistics_ui.get_question_answers = lambda practice_id, start, end: st.session_state.qa_data
+statistics_ui.list_guidance_instructions = lambda practice_id: st.session_state.get("guidance_data", [])
+statistics_ui.save_question_review = lambda *args, **kwargs: None
+statistics_ui.delete_question_review = lambda *args, **kwargs: None
+statistics_ui.save_guidance_instruction = lambda *args, **kwargs: None
+statistics_ui.delete_guidance_instruction = lambda *args, **kwargs: None
 statistics_ui.render_statistics_dashboard()
 '''
 
@@ -86,6 +91,14 @@ class StatisticsServiceTest(unittest.TestCase):
         ]
         self.assertEqual(1, len(filter_question_answers(records, "조립", "제작 방법", "사진 있음", "흔들")))
         self.assertEqual(1, len(filter_question_answers(records, "미분류", "전체", "사진 없음", "")))
+        records[0]["review_status"] = "reviewed"
+        records[1]["review_status"] = "invalid-legacy-value"
+        self.assertEqual(1, len(filter_question_answers(
+            records, review_status="reviewed"
+        )))
+        self.assertEqual(1, len(filter_question_answers(
+            records, review_status="unreviewed"
+        )))
 
     def test_tied_improvement_notes_include_all_leaders(self):
         summary = aggregate_statistics({"sessions": [], "questions": [
@@ -122,15 +135,52 @@ class StatisticsDashboardTest(unittest.TestCase):
             "ai_response_success": True, "review_status": "unreviewed",
         }]
         populated.run(timeout=15)
-        self.assertEqual(4, len(populated.metric))
+        self.assertEqual(7, len(populated.metric))
         headings = " ".join(item.value for item in populated.markdown)
         self.assertIn("제작 단계별 질문 수", headings)
         self.assertIn("날짜별 질문 수 추이", headings)
         self.assertIn("질문 유형별 분포", headings)
         self.assertIn("주요 질문 키워드", headings)
         self.assertIn("학생 질문 및 AI 답변", headings)
-        self.assertEqual(["통계 대시보드", "질문·답변 관리"], [tab.label for tab in populated.tabs])
+        self.assertEqual(
+            ["통계 대시보드", "질문·답변 관리", "답변 개선 사례"],
+            [tab.label for tab in populated.tabs],
+        )
         self.assertTrue(any("실제 학생 수가 아니며" in item.value for item in populated.caption))
+
+    def test_simplified_improvement_case_ui_keeps_draft_without_scope_widgets(self):
+        app = AppTest.from_string(DASHBOARD_SOURCE)
+        app.session_state.stats_data = {"sessions": [], "questions": [question("q1")]}
+        app.session_state.qa_data = [{
+            "event_id": "q1", "practice_id": 1,
+            "occurred_at": "2026-11-20T10:00:00+00:00", "stage_title": "만들기",
+            "step_title": "조립", "question_type": "제작 방법",
+            "student_question": "어떻게 조립하나요?", "ai_answer": "순서대로 하세요.",
+            "keywords": ["조립"], "has_image": False, "ai_response_success": True,
+            "review_status": "unreviewed",
+        }]
+        app.session_state.guidance_data = [{
+            "id": "guide-1", "source_event_id": "q1",
+            "student_question": "어떻게 조립하나요?", "ai_answer": "순서대로 하세요.",
+            "content": "접합면을 먼저 확인하게 한다.", "scope": "practice",
+            "stage_title": None, "question_type": None, "active": True,
+            "author_email": "teacher@example.com", "version": 1,
+            "created_at": "2026-11-20 10:00:00", "updated_at": "2026-11-21 10:00:00",
+        }]
+        app.run(timeout=15)
+        self.assertFalse(any("scope" in str(item.key) for item in app.selectbox))
+        self.assertFalse(any(item.key == "new_guidance_content_1" for item in app.text_area))
+        comment = next(item for item in app.text_area if item.key == "review_comment_q1")
+        comment.set_value("작성 중인 코멘트").run()
+        apply = next(item for item in app.checkbox if item.key == "apply_q1")
+        self.assertTrue(apply.value)
+        apply.uncheck().run()
+        self.assertEqual("작성 중인 코멘트", next(
+            item.value for item in app.text_area if item.key == "review_comment_q1"
+        ))
+        visible = " ".join(item.value for item in app.markdown)
+        self.assertIn("원본 학생 질문", visible)
+        self.assertIn("기존 AI 답변", visible)
 
 
 class SQLiteStatisticsTest(unittest.TestCase):

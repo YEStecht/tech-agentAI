@@ -141,6 +141,27 @@ class SecureDatabaseTest(unittest.TestCase):
         with self.assertRaises(AuthenticationError):
             secure_database.list_practices()
 
+    def test_review_and_guidance_writes_recheck_school_and_actor(self):
+        actor = {"role": "teacher", "email": "t@example.com", "uid": "u",
+                 "school_id": "school-a", "active": True}
+        with patch.object(secure_database, "authorize", return_value=actor), \
+             patch.object(secure_database._database, "get_practice", return_value={
+                 "id": 2, "school_id": "school-b"
+             }), patch.object(secure_database._database, "save_question_review") as save, \
+             self.assertRaises(AuthenticationError):
+            secure_database.save_question_review(2, "event", "", "reviewed", False,
+                                                 "practice", None, None)
+        save.assert_not_called()
+        with patch.object(secure_database, "authorize", return_value=actor), \
+             patch.object(secure_database._database, "get_practice", return_value={
+                 "id": 1, "school_id": "school-a"
+             }), patch.object(secure_database._database, "save_guidance_instruction",
+                              return_value=("g", 1)) as save:
+            secure_database.save_guidance_instruction(
+                1, None, "지침", "practice", None, None, True, expected_version=None
+            )
+        self.assertEqual("u", save.call_args.kwargs["actor"]["uid"])
+
 
 if __name__ == "__main__":
     unittest.main()

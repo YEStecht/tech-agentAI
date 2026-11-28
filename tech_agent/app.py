@@ -14,6 +14,7 @@ from agent_service import (
 from database import (
     create_learning_session, get_student_practice_data, init_db, list_published_practices,
     mark_learning_safety, record_learning_question, record_question_answer,
+    get_relevant_improvement_cases,
 )
 from image_service import prepare_image
 from safety_agent_service import (
@@ -446,10 +447,24 @@ if submission:
             answer = ""
             record_keywords = []
             try:
+                guidance = []
+                try:
+                    previous_questions = "\n".join(
+                        message.get("content", "") for message in st.session_state.messages[:-1]
+                        if message.get("role") == "user"
+                    )
+                    guidance = get_relevant_improvement_cases(
+                        practice_id, display_question, previous_questions[-1000:],
+                        current_stage.get("stage_title") if current_stage else None,
+                        classify_question(display_question),
+                    )
+                except Exception:
+                    logger.exception("답변 개선 사례 조회 실패")
                 turn = ask_agent(
                     agent, display_question, student_data["stages"],
                     st.session_state.agent_session, image, image_mime_type,
                     selected_stage=current_stage,
+                    guidance=guidance,
                 )
             except Exception:
                 logger.exception("학생 AI 응답 처리 실패")

@@ -6,8 +6,13 @@ from html import escape
 import altair as alt
 import streamlit as st
 
-from secure_database import get_learning_statistics, get_question_answers, list_practices
+from secure_database import (
+    delete_guidance_instruction, delete_question_review, get_learning_statistics,
+    get_question_answers, list_guidance_instructions, list_practices,
+    save_guidance_instruction, save_question_review,
+)
 from statistics_service import KST, QUESTION_TYPES, aggregate_statistics, filter_question_answers, improvement_notes
+from guidance_service import GuidanceConflictError, ReviewConflictError
 
 
 def _period():
@@ -94,19 +99,27 @@ def _question_type_chart(values):
     )
 
 
-def _question_answers(records):
+def _question_answers(records, practice_id):
     st.markdown("#### 학생 질문 및 AI 답변")
     if not records:
         st.info("선택한 기간에 저장된 질문·답변 기록이 없습니다. 기존 통계에는 원문이 추가되지 않습니다.")
         return
+    statuses = [item.get("review_status") if item.get("review_status") in {"unreviewed", "reviewed"} else "unreviewed" for item in records]
+    metrics = st.columns(3)
+    metrics[0].metric("전체 기록", len(records))
+    metrics[1].metric("미검토", statuses.count("unreviewed"))
+    metrics[2].metric("검토 완료", statuses.count("reviewed"))
     sort_col, stage_col, type_col = st.columns(3)
     sort_order = sort_col.selectbox("정렬", ["최신순", "과거순"], key="qa_sort")
     stages = ["전체"] + sorted({item.get("stage_title") or "미분류" for item in records})
     stage = stage_col.selectbox("제작 단계", stages, key="qa_stage")
     question_type = type_col.selectbox("질문 유형", ["전체", *QUESTION_TYPES], key="qa_type")
-    image = st.selectbox("사진 활용", ["전체", "사진 있음", "사진 없음"], key="qa_image")
+    image_col, review_col = st.columns(2)
+    image = image_col.selectbox("사진 활용", ["전체", "사진 있음", "사진 없음"], key="qa_image")
+    review_label = review_col.selectbox("검토 상태", ["전체", "미검토", "검토 완료"], key="qa_review")
+    review_filter = {"전체": "전체", "미검토": "unreviewed", "검토 완료": "reviewed"}[review_label]
     search = st.text_input("질문 및 답변 검색", placeholder="키워드를 입력하세요.", key="qa_search")
-    filtered = filter_question_answers(records, stage, question_type, image, search)
+    filtered = filter_question_answers(records, stage, question_type, image, search, review_filter)
     filtered.sort(key=lambda item: str(item.get("occurred_at", "")), reverse=sort_order == "최신순")
     page_size = 10
     page_count = max(1, (len(filtered) + page_size - 1) // page_size)
@@ -121,11 +134,128 @@ def _question_answers(records):
         stage_label = item.get("stage_title") or "미분류"
         if item.get("step_title"): stage_label += f" → {item['step_title']}"
         photo = " · 📷 사진 활용" if item.get("has_image") else ""
-        st.caption(f"{occurred} · {stage_label} · {item.get('question_type', '기타')}{photo}")
-        st.markdown(f"**학생 질문:** {item.get('student_question', '')}")
-        with st.expander("AI 답변 보기"):
+        status = item.get("review_status") if item.get("review_status") in {"unreviewed", "reviewed"} else "unreviewed"
+        status_label = "✅ 검토 완료" if status == "reviewed" else "🕓 미검토"
+        with st.expander(f"{status_label} · {occurred} · {stage_label}"):
+            st.caption(f"{item.get('question_type', '기타')}{photo}")
+            st.markdown(f"**학생 질문:** {item.get('student_question', '')}")
+            st.markdown("**실제 AI 답변:**")
             if item.get("ai_response_success"): st.write(item.get("ai_answer") or "저장된 답변이 없습니다.")
             else: st.warning("AI 답변 제공에 실패한 질문입니다.")
+            event_id = item["event_id"]
+            comment = st.text_area(
+                "교사 답변 개선 지침", value=item.get("teacher_comment") or "",
+                key=f"review_comment_{event_id}", max_chars=500,
+                help="학생 화면에는 표시되지 않습니다.",
+            )
+            reviewed = st.checkbox(
+                "검토 완료", value=status == "reviewed", key=f"reviewed_{event_id}",
+                help="코멘트 없이도 검토 완료로 저장할 수 있습니다.",
+            )
+            apply_to_ai = st.checkbox(
+                "이후 유사한 질문에 반영",
+                value=bool(item.get("apply_to_ai")) if item.get("review_version") is not None else True,
+                key=f"apply_{event_id}",
+                help="현재 질문과 문제 상황이 유사한 경우에만 개선 사례로 전달됩니다.",
+            )
+            save_col, delete_col = st.columns(2)
+            if save_col.button("검토 내용 저장", key=f"save_review_{event_id}", type="primary"):
+                try:
+                    save_question_review(
+                        practice_id, event_id, comment,
+                        "reviewed" if reviewed else "unreviewed",
+                        apply_to_ai and bool(comment.strip()),
+                        "practice", None, None,
+                        expected_version=item.get("review_version"),
+                    )
+                    st.success("검토 내용을 저장했습니다.")
+                    st.rerun()
+                except (ValueError, ReviewConflictError) as exc:
+                    st.warning(str(exc))
+            if item.get("review_version") is not None and delete_col.button(
+                "코멘트·검토 삭제", key=f"delete_review_{event_id}"
+            ):
+                st.session_state["confirm_delete_review"] = event_id
+            if st.session_state.get("confirm_delete_review") == event_id:
+                st.warning("검토 내용을 삭제하면 연결된 AI 지도 지침은 즉시 비활성화됩니다.")
+                yes, no = st.columns(2)
+                if yes.button("삭제 확인", key=f"confirm_delete_review_{event_id}"):
+                    try:
+                        delete_question_review(
+                            practice_id, event_id, expected_version=item.get("review_version")
+                        )
+                        st.session_state.pop("confirm_delete_review", None)
+                        st.rerun()
+                    except ReviewConflictError as exc:
+                        st.warning(str(exc))
+                if no.button("취소", key=f"cancel_delete_review_{event_id}"):
+                    st.session_state.pop("confirm_delete_review", None)
+                    st.rerun()
+
+
+def _improvement_case_management(practice_id):
+    st.markdown("#### 답변 개선 사례")
+    st.caption("실제 학생 질문과 기존 AI 답변에 연결된 교사 개선 지침만 관리합니다.")
+    try:
+        instructions = list_guidance_instructions(practice_id)
+    except Exception:
+        st.error("지도 지침을 불러오지 못했습니다.")
+        return
+    cases = [item for item in instructions if item.get("source_event_id")]
+    legacy_count = len(instructions) - len(cases)
+    if legacy_count:
+        st.info(
+            f"기존 일반 지도 지침 {legacy_count}건은 삭제하거나 사례로 변환하지 않고 보존했습니다. "
+            "신규 답변 개선 사례 선정에는 사용하지 않습니다."
+        )
+    if not cases:
+        st.info("등록된 답변 개선 사례가 없습니다.")
+        return
+    for item in cases:
+        active_label = "활성" if item.get("active") else "비활성"
+        with st.expander(f"{active_label} · {item.get('student_question') or '원본 질문 없음'}"):
+            st.markdown(f"**원본 학생 질문:** {item.get('student_question') or '저장된 질문이 없습니다.'}")
+            st.markdown("**기존 AI 답변:**")
+            st.write(item.get("ai_answer") or "저장된 답변이 없습니다.")
+            content = st.text_area(
+                "교사 답변 개선 지침", value=item.get("content", ""),
+                key=f"guidance_content_{item['id']}", max_chars=500,
+            )
+            active = st.checkbox(
+                "이후 유사한 질문에 반영", value=bool(item.get("active")),
+                key=f"guidance_active_{item['id']}",
+            )
+            st.caption(
+                f"등록: {item.get('created_at', '-')} · 수정: {item.get('updated_at', '-')} · "
+                f"마지막 작성 교사: {item.get('author_email', '-')} · 버전 {item.get('version', 1)}"
+            )
+            save_col, delete_col = st.columns(2)
+            if save_col.button("변경사항 저장", key=f"save_guidance_{item['id']}"):
+                try:
+                    save_guidance_instruction(
+                        practice_id, item["id"], content, "practice", None, None,
+                        active, expected_version=item.get("version"),
+                    )
+                    st.rerun()
+                except (ValueError, GuidanceConflictError) as exc:
+                    st.warning(str(exc))
+            if delete_col.button("삭제", key=f"delete_guidance_{item['id']}"):
+                st.session_state["confirm_delete_guidance"] = item["id"]
+            if st.session_state.get("confirm_delete_guidance") == item["id"]:
+                st.warning("삭제하면 연결된 교사 코멘트의 AI 반영 선택도 해제됩니다. 되돌릴 수 없습니다.")
+                yes, no = st.columns(2)
+                if yes.button("삭제 확인", key=f"confirm_guidance_{item['id']}"):
+                    try:
+                        delete_guidance_instruction(
+                            practice_id, item["id"], expected_version=item.get("version")
+                        )
+                        st.session_state.pop("confirm_delete_guidance", None)
+                        st.rerun()
+                    except GuidanceConflictError as exc:
+                        st.warning(str(exc))
+                if no.button("취소", key=f"cancel_guidance_{item['id']}"):
+                    st.session_state.pop("confirm_delete_guidance", None)
+                    st.rerun()
 
 
 def render_statistics_dashboard():
@@ -154,7 +284,9 @@ def render_statistics_dashboard():
     except Exception:
         st.error("학습 통계를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.")
         return
-    dashboard_tab, records_tab = st.tabs(["통계 대시보드", "질문·답변 관리"])
+    dashboard_tab, records_tab, cases_tab = st.tabs(
+        ["통계 대시보드", "질문·답변 관리", "답변 개선 사례"]
+    )
     with dashboard_tab:
         if not summary["session_count"] and not summary["question_count"]:
             st.info("선택한 기간에 수집된 익명 통계가 없습니다.")
@@ -196,5 +328,6 @@ def render_statistics_dashboard():
             notes = improvement_notes(summary)
             st.info("\n\n".join(f"• {note}" for note in notes) if notes else "요약할 질문 데이터가 없습니다.")
     with records_tab:
-        st.caption("향후 교사 코멘트 기능을 이 화면에 추가할 예정입니다.")
-        _question_answers(records)
+        _question_answers(records, practice_id)
+    with cases_tab:
+        _improvement_case_management(practice_id)

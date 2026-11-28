@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import json
+import uuid
 from contextlib import closing
 from pathlib import Path
 
@@ -12,6 +13,10 @@ from safety_editor import (
 )
 from publication import publication_requirements, require_publishable
 from statistics_service import in_kst_period, is_safe_question_answer_record
+from guidance_service import (
+    GuidanceConflictError, ReviewConflictError, normalized_review_status,
+    safe_teacher_text, select_guidance, select_improvement_cases, validate_scope,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("PRACTICE_DB_PATH", str(BASE_DIR / "practice_data.db")))
@@ -26,6 +31,10 @@ __all__ = [
     "create_learning_session", "mark_learning_safety",
     "record_learning_question", "get_learning_statistics",
     "record_question_answer", "get_question_answers",
+    "save_question_review", "delete_question_review",
+    "list_guidance_instructions", "save_guidance_instruction",
+    "delete_guidance_instruction", "get_active_guidance_instructions",
+    "get_relevant_improvement_cases",
 ]
 
 
@@ -151,6 +160,38 @@ def init_db():
                 review_status TEXT NOT NULL DEFAULT 'unreviewed',
                 retention_until TEXT,
                 schema_version INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS teacher_qa_reviews (
+                event_id TEXT PRIMARY KEY,
+                practice_id INTEGER NOT NULL,
+                comment TEXT NOT NULL DEFAULT '',
+                review_status TEXT NOT NULL DEFAULT 'unreviewed',
+                apply_to_ai INTEGER NOT NULL DEFAULT 0,
+                guidance_id TEXT,
+                author_uid TEXT NOT NULL,
+                author_email TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS practice_guidance_instructions (
+                id TEXT PRIMARY KEY,
+                practice_id INTEGER NOT NULL,
+                source_event_id TEXT,
+                content TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                stage_title TEXT,
+                question_type TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                author_uid TEXT NOT NULL,
+                author_email TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -417,7 +458,15 @@ def record_question_answer(record):
 def get_question_answers(practice_id, start_date, end_date):
     with closing(get_connection()) as conn:
         rows = conn.execute(
-            "SELECT * FROM learning_question_answers WHERE practice_id = ?",
+            "SELECT qa.*, r.comment AS teacher_comment, r.apply_to_ai, "
+            "r.guidance_id, r.author_email AS review_author_email, "
+            "r.version AS review_version, r.updated_at AS review_updated_at, "
+            "r.review_status AS saved_review_status, g.scope AS guidance_scope, "
+            "g.stage_title AS guidance_stage_title, "
+            "g.question_type AS guidance_question_type "
+            "FROM learning_question_answers qa LEFT JOIN teacher_qa_reviews r "
+            "ON r.event_id = qa.event_id LEFT JOIN practice_guidance_instructions g "
+            "ON g.id = r.guidance_id WHERE qa.practice_id = ?",
             (int(practice_id),),
         ).fetchall()
     result = []
@@ -428,8 +477,186 @@ def get_question_answers(practice_id, start_date, end_date):
         item["keywords"] = json.loads(item.pop("keywords_json"))
         item["has_image"] = bool(item["has_image"])
         item["ai_response_success"] = bool(item["ai_response_success"])
+        item["review_status"] = normalized_review_status(
+            item.pop("saved_review_status") or item.get("review_status")
+        )
+        item["apply_to_ai"] = bool(item.get("apply_to_ai"))
         result.append(item)
     return result
+
+
+def save_question_review(
+    practice_id, event_id, comment, review_status, apply_to_ai, scope,
+    stage_title, question_type, actor, expected_version=None,
+):
+    comment = safe_teacher_text(comment)
+    review_status = normalized_review_status(review_status)
+    if apply_to_ai:
+        if not comment:
+            raise ValueError("AI 답변에 반영하려면 교사 코멘트를 입력해 주세요.")
+        validate_scope(scope, stage_title, question_type)
+    with closing(get_connection()) as conn, conn:
+        question = conn.execute(
+            "SELECT event_id FROM learning_question_answers WHERE event_id = ? AND practice_id = ?",
+            (event_id, int(practice_id)),
+        ).fetchone()
+        if not question:
+            raise ValueError("질문·답변 기록을 찾을 수 없습니다.")
+        current = conn.execute(
+            "SELECT * FROM teacher_qa_reviews WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        current_version = int(current["version"]) if current else None
+        if current_version != expected_version:
+            raise ReviewConflictError("다른 교사가 먼저 검토 내용을 변경했습니다.")
+        guidance_id = current["guidance_id"] if current else None
+        if apply_to_ai:
+            guidance_id = guidance_id or f"review-{event_id}"
+            guidance = conn.execute(
+                "SELECT version FROM practice_guidance_instructions WHERE id = ?", (guidance_id,)
+            ).fetchone()
+            if guidance:
+                conn.execute(
+                    "UPDATE practice_guidance_instructions SET content = ?, scope = ?, "
+                    "stage_title = ?, question_type = ?, active = 1, author_uid = ?, "
+                    "author_email = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (comment, scope, stage_title, question_type, actor["uid"], actor["email"], guidance_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO practice_guidance_instructions "
+                    "(id, practice_id, source_event_id, content, scope, stage_title, question_type, "
+                    "active, author_uid, author_email) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                    (guidance_id, int(practice_id), event_id, comment, scope, stage_title,
+                     question_type, actor["uid"], actor["email"]),
+                )
+        elif guidance_id:
+            conn.execute(
+                "UPDATE practice_guidance_instructions SET active = 0, version = version + 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?", (guidance_id,)
+            )
+        version = (current_version or 0) + 1
+        if current:
+            conn.execute(
+                "UPDATE teacher_qa_reviews SET comment = ?, review_status = ?, apply_to_ai = ?, "
+                "guidance_id = ?, author_uid = ?, author_email = ?, version = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE event_id = ?",
+                (comment, review_status, int(bool(apply_to_ai)), guidance_id, actor["uid"],
+                 actor["email"], version, event_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO teacher_qa_reviews (event_id, practice_id, comment, review_status, "
+                "apply_to_ai, guidance_id, author_uid, author_email, version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, int(practice_id), comment, review_status, int(bool(apply_to_ai)),
+                 guidance_id, actor["uid"], actor["email"], version),
+            )
+    return version
+
+
+def delete_question_review(practice_id, event_id, actor, expected_version):
+    with closing(get_connection()) as conn, conn:
+        current = conn.execute(
+            "SELECT * FROM teacher_qa_reviews WHERE event_id = ? AND practice_id = ?",
+            (event_id, int(practice_id)),
+        ).fetchone()
+        if not current:
+            return False
+        if int(current["version"]) != expected_version:
+            raise ReviewConflictError("다른 교사가 먼저 검토 내용을 변경했습니다.")
+        if current["guidance_id"]:
+            conn.execute(
+                "UPDATE practice_guidance_instructions SET active = 0, version = version + 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?", (current["guidance_id"],)
+            )
+        conn.execute("DELETE FROM teacher_qa_reviews WHERE event_id = ?", (event_id,))
+        return True
+
+
+def list_guidance_instructions(practice_id):
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            "SELECT g.*, qa.student_question, qa.ai_answer, qa.keywords_json, "
+            "qa.stage_title AS source_stage_title, qa.question_type AS source_question_type "
+            "FROM practice_guidance_instructions g LEFT JOIN learning_question_answers qa "
+            "ON qa.event_id = g.source_event_id WHERE g.practice_id = ? ORDER BY g.updated_at DESC",
+            (int(practice_id),),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = {**dict(row), "active": bool(row["active"])}
+        item["keywords"] = json.loads(item.pop("keywords_json") or "[]")
+        item["stage_title"] = item.get("source_stage_title") or item.get("stage_title")
+        item["question_type"] = item.get("source_question_type") or item.get("question_type")
+        result.append(item)
+    return result
+
+
+def save_guidance_instruction(
+    practice_id, instruction_id, content, scope, stage_title, question_type,
+    active, actor, expected_version=None,
+):
+    content = safe_teacher_text(content, required=True)
+    validate_scope(scope, stage_title, question_type)
+    instruction_id = instruction_id or uuid.uuid4().hex
+    with closing(get_connection()) as conn, conn:
+        current = conn.execute(
+            "SELECT * FROM practice_guidance_instructions WHERE id = ? AND practice_id = ?",
+            (instruction_id, int(practice_id)),
+        ).fetchone()
+        current_version = int(current["version"]) if current else None
+        if current_version != expected_version:
+            raise GuidanceConflictError("다른 교사가 먼저 지도 지침을 변경했습니다.")
+        version = (current_version or 0) + 1
+        if current:
+            conn.execute(
+                "UPDATE practice_guidance_instructions SET content = ?, scope = ?, stage_title = ?, "
+                "question_type = ?, active = ?, author_uid = ?, author_email = ?, version = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (content, scope, stage_title, question_type, int(bool(active)), actor["uid"],
+                 actor["email"], version, instruction_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO practice_guidance_instructions (id, practice_id, content, scope, "
+                "stage_title, question_type, active, author_uid, author_email, version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (instruction_id, int(practice_id), content, scope, stage_title, question_type,
+                 int(bool(active)), actor["uid"], actor["email"], version),
+            )
+    return instruction_id, version
+
+
+def delete_guidance_instruction(practice_id, instruction_id, expected_version):
+    with closing(get_connection()) as conn, conn:
+        current = conn.execute(
+            "SELECT version FROM practice_guidance_instructions WHERE id = ? AND practice_id = ?",
+            (instruction_id, int(practice_id)),
+        ).fetchone()
+        if not current:
+            return False
+        if int(current["version"]) != expected_version:
+            raise GuidanceConflictError("다른 교사가 먼저 지도 지침을 변경했습니다.")
+        conn.execute("DELETE FROM practice_guidance_instructions WHERE id = ?", (instruction_id,))
+        conn.execute(
+            "UPDATE teacher_qa_reviews SET apply_to_ai = 0, guidance_id = NULL, "
+            "version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE guidance_id = ?",
+            (instruction_id,),
+        )
+        return True
+
+
+def get_active_guidance_instructions(practice_id, stage_title=None, question_type=None):
+    return select_guidance(list_guidance_instructions(practice_id), stage_title, question_type)
+
+
+def get_relevant_improvement_cases(
+    practice_id, question, conversation_context="", stage_title=None, question_type=None,
+):
+    return select_improvement_cases(
+        list_guidance_instructions(practice_id), question, conversation_context,
+        stage_title, question_type,
+    )
 
 
 def save_safety_checklist(practice_id, items, expected_version=None):

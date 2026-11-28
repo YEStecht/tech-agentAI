@@ -72,6 +72,7 @@ _PROTECTED = (
     "save_stage_plan", "get_safety_checklist", "save_safety_checklist",
     "get_publish_requirements", "set_practice_published", "get_learning_statistics",
     "get_question_answers",
+    "list_guidance_instructions",
 )
 
 
@@ -86,6 +87,7 @@ for _name in (
     "get_stage_plan", "save_stage_plan", "get_safety_checklist", "save_safety_checklist",
     "get_publish_requirements", "set_practice_published", "get_learning_statistics",
     "get_question_answers",
+    "list_guidance_instructions",
 ):
     globals()[_name] = (lambda name: lambda practice_id, *args, **kwargs:
                         _practice_call(name, practice_id, *args, **kwargs))(_name)
@@ -101,4 +103,27 @@ def get_practice_file(file_id):
 def remove_practice_file(file_id):
     item = get_practice_file(file_id)
     return False if not item else _call("remove_practice_file", file_id)
+
+
+def save_question_review(practice_id, *args, **kwargs):
+    actor = _require_actor()
+    _require_practice(practice_id)
+    return _database.save_question_review(practice_id, *args, actor=actor, **kwargs)
+
+
+def delete_question_review(practice_id, *args, **kwargs):
+    actor = _require_actor()
+    _require_practice(practice_id)
+    return _database.delete_question_review(practice_id, *args, actor=actor, **kwargs)
+
+
+def save_guidance_instruction(practice_id, *args, **kwargs):
+    actor = _require_actor()
+    _require_practice(practice_id)
+    return _database.save_guidance_instruction(practice_id, *args, actor=actor, **kwargs)
+
+
+def delete_guidance_instruction(practice_id, *args, **kwargs):
+    _require_practice(practice_id)
+    return _database.delete_guidance_instruction(practice_id, *args, **kwargs)
 
