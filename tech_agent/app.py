@@ -9,18 +9,18 @@ import streamlit as st
 from agents import SQLiteSession
 
 from agent_service import (
-    ask_agent, create_agent, resolve_stage, validated_question_type,
+    ask_agent, create_agent, resolve_stage, validated_keywords, validated_question_type,
 )
 from database import (
     create_learning_session, get_student_practice_data, init_db, list_published_practices,
-    mark_learning_safety, record_learning_question,
+    mark_learning_safety, record_learning_question, record_question_answer,
 )
 from image_service import prepare_image
 from safety_agent_service import (
     create_safety_agent, evaluate_safety_answer, generate_safety_questions,
 )
 from safety_editor import is_choice_checklist, is_correct_choice
-from statistics_service import classify_question
+from statistics_service import classify_question, prepare_question_answer_record, strip_internal_references
 
 
 st.set_page_config(page_title="기술 제작 실습 AI 도우미", page_icon="🛠️", layout="centered")
@@ -368,10 +368,11 @@ with st.sidebar:
                 st.caption(step["activity"])
 
 detected_stage = st.session_state.get(detected_stage_key)
+stage_status = st.empty()
 if current_stage:
     st.caption(f"📍 학생 지정 · {current_stage['stage_title']} → {current_stage['step_title']}")
 if detected_stage:
-    st.caption(f"📍 AI 판단 · {detected_stage['stage_title']} → {detected_stage['step_title']}")
+    stage_status.caption(f"📍 AI 판단 · {detected_stage['stage_title']} → {detected_stage['step_title']}")
 elif not current_stage:
     st.caption("📍 현재 단계 · 질문 후 AI가 자동으로 파악해요")
 if st.session_state.get(stage_conflict_key):
@@ -403,6 +404,10 @@ for message in st.session_state.messages:
             st.caption("📷 사진 첨부됨 (원본은 저장하지 않음)")
 
 st.caption("📷 얼굴·이름표는 빼고 제작물만 찍어 주세요. 원본 사진은 저장하지 않아요.")
+st.caption(
+    "개인정보를 제거한 질문과 AI 답변은 담당 교사의 수업 개선을 위해 기록될 수 있어요. "
+    "이름·학번·연락처는 입력하지 마세요."
+)
 submission = st.chat_input(
     "어려운 점을 쓰거나 제작물 사진을 첨부해 주세요.",
     accept_file=True,
@@ -438,6 +443,8 @@ if submission:
         with st.spinner("실습 자료를 확인하고 있어요..."):
             response_success = False
             inferred_stage = None
+            answer = ""
+            record_keywords = []
             try:
                 turn = ask_agent(
                     agent, display_question, student_data["stages"],
@@ -449,7 +456,8 @@ if submission:
                 st.error("답변을 불러오지 못했어요. 잠시 후 다시 시도하거나 선생님께 알려 주세요.")
             else:
                 response_success = True
-                answer = turn.answer
+                answer = strip_internal_references(turn.answer)
+                record_keywords = validated_keywords(turn)
                 stage_resolution = resolve_stage(
                     student_data["stages"], turn, selected_stage=current_stage,
                     has_image=bool(image),
@@ -457,12 +465,16 @@ if submission:
                 inferred_stage = stage_resolution["inferred"]
                 if inferred_stage:
                     st.session_state[detected_stage_key] = inferred_stage
+                    stage_status.caption(
+                        f"📍 AI 판단 · {inferred_stage['stage_title']} → {inferred_stage['step_title']}"
+                    )
                     st.caption(
                         f"AI 판단 단계: {inferred_stage['stage_title']} → "
                         f"{inferred_stage['step_title']}"
                     )
                 else:
                     st.session_state.pop(detected_stage_key, None)
+                    stage_status.empty()
                     st.caption("AI 판단 단계: 미분류")
                 st.session_state[stage_conflict_key] = stage_resolution["conflict"]
                 if stage_resolution["conflict"]:
@@ -480,7 +492,7 @@ if submission:
                     validated_question_type(turn, classify_question(display_question))
                     if response_success else classify_question(display_question)
                 )
-                record_stat(record_learning_question, {
+                event = {
                     "event_id": event_id,
                     "practice_id": practice_id,
                     "session_id": st.session_state.learning_session_id,
@@ -493,4 +505,10 @@ if submission:
                     "question_type": question_type,
                     "has_image": bool(image),
                     "ai_response_success": response_success,
-                })
+                }
+                record_stat(record_learning_question, event)
+                qa_record = prepare_question_answer_record(
+                    event, display_question, answer, record_keywords
+                )
+                if qa_record:
+                    record_stat(record_question_answer, qa_record)

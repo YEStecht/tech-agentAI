@@ -71,6 +71,7 @@ _PROTECTED = (
     "get_practice_file", "remove_practice_file", "get_stage_plan",
     "save_stage_plan", "get_safety_checklist", "save_safety_checklist",
     "get_publish_requirements", "set_practice_published", "get_learning_statistics",
+    "get_question_answers",
 )
 
 
@@ -84,6 +85,7 @@ for _name in (
     "update_practice", "set_vector_store", "list_practice_files", "add_practice_file",
     "get_stage_plan", "save_stage_plan", "get_safety_checklist", "save_safety_checklist",
     "get_publish_requirements", "set_practice_published", "get_learning_statistics",
+    "get_question_answers",
 ):
     globals()[_name] = (lambda name: lambda practice_id, *args, **kwargs:
                         _practice_call(name, practice_id, *args, **kwargs))(_name)

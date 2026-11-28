@@ -31,6 +31,7 @@ import streamlit as st
 st.session_state.setdefault("test_public", {1: True, 2: True, 3: False})
 st.session_state.setdefault("test_stat_sessions", {})
 st.session_state.setdefault("test_stat_questions", {})
+st.session_state.setdefault("test_qa_records", {})
 st.session_state.setdefault("test_stat_failure", False)
 
 PRACTICES = {
@@ -99,9 +100,16 @@ def record_learning_question(event):
     if st.session_state.test_stat_failure:
         raise RuntimeError("mock statistics failure")
     st.session_state.test_stat_questions.setdefault(event["event_id"], event)
+def record_question_answer(record):
+    if st.session_state.test_stat_failure:
+        raise RuntimeError("mock qa failure")
+    before = len(st.session_state.test_qa_records)
+    st.session_state.test_qa_records.setdefault(record["event_id"], record)
+    return len(st.session_state.test_qa_records) > before
 database.create_learning_session = create_learning_session
 database.mark_learning_safety = mark_learning_safety
 database.record_learning_question = record_learning_question
+database.record_question_answer = record_question_answer
 agents.SQLiteSession = FakeSession
 agent_service.create_agent = lambda vector_store_id: st.session_state.__setitem__("test_vector_store", vector_store_id) or object()
 def ask_agent(agent, question, stages, session, image=None, image_mime_type=None, selected_stage=None):
@@ -121,9 +129,10 @@ def ask_agent(agent, question, stages, session, image=None, image_mime_type=None
     else:
         stage_index = step_index = None
     return agent_service.DiagnosisTurn(
-        answer="모의 답변", stage_index=stage_index, step_index=step_index,
+        answer="모의 답변 【4:0†source】 file-AbCdEf123", stage_index=stage_index, step_index=step_index,
         stage_conflict=conflict,
         question_type="문제 원인 및 해결" if "왜" in question else "기타",
+        keywords=["조립", "흔들림"],
     )
 agent_service.ask_agent = ask_agent
 safety_agent_service.create_safety_agent = lambda vector_store_id, items: object()
@@ -216,7 +225,8 @@ class AgentServiceTest(unittest.TestCase):
     def test_stage_and_question_type_are_server_validated(self):
         stages = [{"title": "만들기", "steps": [{"title": "조립", "activity": "조립"}]}]
         valid = agent_service.DiagnosisTurn(
-            answer="답", stage_index=0, step_index=0, question_type="제작 방법"
+            answer="답", stage_index=0, step_index=0, question_type="제작 방법",
+            keywords=["조립", "조립", "kid@example.com", "접착"],
         )
         invalid = agent_service.DiagnosisTurn(
             answer="답", stage_index=-1, step_index=9, question_type="임의 유형"
@@ -224,6 +234,8 @@ class AgentServiceTest(unittest.TestCase):
         self.assertEqual("조립", agent_service.resolve_stage(stages, valid)["confirmed"]["step_title"])
         self.assertIsNone(agent_service.resolve_stage(stages, invalid, has_image=True)["confirmed"])
         self.assertEqual("기타", agent_service.validated_question_type(invalid, "기타"))
+        self.assertEqual(["조립", "접착"], agent_service.validated_keywords(valid))
+        self.assertIn("내부 기록용이며 answer에 노출하지 않는다", agent_service.INSTRUCTIONS)
 
     def test_new_evidence_can_replace_a_directly_selected_stage(self):
         stages = [
@@ -377,6 +389,10 @@ class StudentAppTest(unittest.TestCase):
         stats = list(app.session_state.test_stat_questions.values())
         self.assertEqual("조립하기", stats[-1]["step_title"])
         self.assertEqual("문제 원인 및 해결", stats[-1]["question_type"])
+        qa = list(app.session_state.test_qa_records.values())[-1]
+        self.assertEqual(("모의 답변", ["조립", "흔들림"]), (qa["ai_answer"], qa["keywords"]))
+        self.assertNotIn("file-", " ".join(item["content"] for item in app.session_state.messages))
+        self.assertNotIn("session_id", qa)
 
         next(item for item in app.checkbox if item.key == "specify_stage_1").check().run()
         self.assertEqual("1단계. 만들기", app.selectbox[0].value)

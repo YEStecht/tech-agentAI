@@ -11,6 +11,7 @@ from safety_editor import (
     SafetyChecklistConflictError, cleaned_items, validate_items,
 )
 from publication import publication_requirements, require_publishable
+from statistics_service import in_kst_period, is_safe_question_answer_record
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("PRACTICE_DB_PATH", str(BASE_DIR / "practice_data.db")))
@@ -24,6 +25,7 @@ __all__ = [
     "list_published_practices", "get_student_practice_data",
     "create_learning_session", "mark_learning_safety",
     "record_learning_question", "get_learning_statistics",
+    "record_question_answer", "get_question_answers",
 ]
 
 
@@ -129,6 +131,26 @@ def init_db():
                 question_type TEXT NOT NULL,
                 has_image INTEGER NOT NULL,
                 ai_response_success INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS learning_question_answers (
+                event_id TEXT PRIMARY KEY,
+                practice_id INTEGER NOT NULL,
+                occurred_at TEXT NOT NULL,
+                stage_index INTEGER,
+                stage_title TEXT,
+                step_index INTEGER,
+                step_title TEXT,
+                question_type TEXT NOT NULL,
+                student_question TEXT NOT NULL,
+                ai_answer TEXT NOT NULL,
+                keywords_json TEXT NOT NULL DEFAULT '[]',
+                has_image INTEGER NOT NULL,
+                ai_response_success INTEGER NOT NULL,
+                review_status TEXT NOT NULL DEFAULT 'unreviewed',
+                retention_until TEXT,
+                schema_version INTEGER NOT NULL DEFAULT 1
             )
         """)
 
@@ -359,19 +381,55 @@ def record_learning_question(event):
 def get_learning_statistics(practice_id, start_date, end_date):
     with closing(get_connection()) as conn:
         sessions = conn.execute(
-            "SELECT * FROM anonymous_learning_sessions WHERE practice_id = ? "
-            "AND substr(started_at, 1, 10) BETWEEN ? AND ?",
-            (int(practice_id), str(start_date), str(end_date)),
+            "SELECT * FROM anonymous_learning_sessions WHERE practice_id = ?",
+            (int(practice_id),),
         ).fetchall()
         questions = conn.execute(
-            "SELECT * FROM anonymous_learning_questions WHERE practice_id = ? "
-            "AND substr(occurred_at, 1, 10) BETWEEN ? AND ?",
-            (int(practice_id), str(start_date), str(end_date)),
+            "SELECT * FROM anonymous_learning_questions WHERE practice_id = ?",
+            (int(practice_id),),
         ).fetchall()
     return {
-        "sessions": [dict(item) for item in sessions],
-        "questions": [dict(item) for item in questions],
+        "sessions": [dict(item) for item in sessions if in_kst_period(item["started_at"], start_date, end_date)],
+        "questions": [dict(item) for item in questions if in_kst_period(item["occurred_at"], start_date, end_date)],
     }
+
+
+def record_question_answer(record):
+    if not is_safe_question_answer_record(record):
+        return False
+    fields = (
+        "event_id", "practice_id", "occurred_at", "stage_index", "stage_title",
+        "step_index", "step_title", "question_type", "student_question", "ai_answer",
+        "has_image", "ai_response_success", "review_status", "retention_until", "schema_version",
+    )
+    values = [record.get(field) for field in fields]
+    values[10:12] = [int(bool(value)) for value in values[10:12]]
+    with closing(get_connection()) as conn, conn:
+        cursor = conn.execute(
+            f"INSERT OR IGNORE INTO learning_question_answers "
+            f"({', '.join(fields)}, keywords_json) VALUES "
+            f"({', '.join('?' for _ in fields)}, ?)",
+            values + [json.dumps(record.get("keywords", []), ensure_ascii=False)],
+        )
+        return cursor.rowcount > 0
+
+
+def get_question_answers(practice_id, start_date, end_date):
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM learning_question_answers WHERE practice_id = ?",
+            (int(practice_id),),
+        ).fetchall()
+    result = []
+    for row in rows:
+        if not in_kst_period(row["occurred_at"], start_date, end_date):
+            continue
+        item = dict(row)
+        item["keywords"] = json.loads(item.pop("keywords_json"))
+        item["has_image"] = bool(item["has_image"])
+        item["ai_response_success"] = bool(item["ai_response_success"])
+        result.append(item)
+    return result
 
 
 def save_safety_checklist(practice_id, items, expected_version=None):

@@ -11,6 +11,7 @@ from safety_editor import (
     SafetyChecklistConflictError, cleaned_items, is_choice_checklist, validate_items,
 )
 from publication import publication_requirements, require_publishable
+from statistics_service import in_kst_period, is_safe_question_answer_record
 
 PRACTICES = "practices"
 PRACTICE_FILES = "practice_files"
@@ -18,6 +19,7 @@ COUNTERS = "system_counters"
 COUNTER_DOCUMENT = "practice_data"
 LEARNING_SESSIONS = "anonymous_learning_sessions"
 LEARNING_QUESTIONS = "anonymous_learning_questions"
+QUESTION_ANSWERS = "learning_question_answers"
 __all__ = [
     "get_connection", "init_db", "create_practice", "list_practices", "get_practice",
     "update_practice", "set_vector_store", "list_practice_files", "delete_practice",
@@ -28,6 +30,7 @@ __all__ = [
     "list_published_practices", "get_student_practice_data",
     "create_learning_session", "mark_learning_safety",
     "record_learning_question", "get_learning_statistics",
+    "record_question_answer", "get_question_answers",
 ]
 
 
@@ -379,12 +382,43 @@ def get_learning_statistics(practice_id, start_date, end_date):
         ).stream()
         return [
             item.to_dict() for item in snapshots
-            if str(start_date) <= str(item.to_dict().get(timestamp, ""))[:10] <= str(end_date)
+            if in_kst_period(item.to_dict().get(timestamp), start_date, end_date)
         ]
     return {
         "sessions": matching(LEARNING_SESSIONS, "started_at"),
         "questions": matching(LEARNING_QUESTIONS, "occurred_at"),
     }
+
+
+def record_question_answer(record):
+    if not is_safe_question_answer_record(record):
+        return False
+    client = get_firestore_client()
+    reference = client.collection(QUESTION_ANSWERS).document(record["event_id"])
+    allowed = {
+        "schema_version", "event_id", "practice_id", "occurred_at", "stage_index",
+        "stage_title", "step_index", "step_title", "question_type", "student_question",
+        "ai_answer", "keywords", "has_image", "ai_response_success", "review_status",
+        "retention_until",
+    }
+
+    def operation(transaction):
+        if reference.get(transaction=transaction).exists:
+            return False
+        transaction.set(reference, {key: value for key, value in record.items() if key in allowed})
+        return True
+
+    return _run_transaction(client, operation)
+
+
+def get_question_answers(practice_id, start_date, end_date):
+    snapshots = get_firestore_client().collection(QUESTION_ANSWERS).where(
+        "practice_id", "==", int(practice_id)
+    ).stream()
+    return [
+        item.to_dict() for item in snapshots
+        if in_kst_period(item.to_dict().get("occurred_at"), start_date, end_date)
+    ]
 
 
 def save_safety_checklist(practice_id, items, expected_version=None):

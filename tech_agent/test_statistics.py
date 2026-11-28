@@ -2,13 +2,18 @@
 
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 import firestore_database as firestore_db
 import sqlite_database as sqlite_db
 from streamlit.testing.v1 import AppTest
-from statistics_service import aggregate_statistics, classify_question, improvement_notes
+from statistics_service import (
+    aggregate_statistics, classify_question, filter_question_answers, improvement_notes,
+    in_kst_period, prepare_question_answer_record, redact_personal_data, strip_internal_references,
+    validated_keywords,
+)
 from test_database_backends import FakeClient
 
 
@@ -18,6 +23,7 @@ import statistics_ui
 
 statistics_ui.list_practices = lambda: [{"id": 1, "title": "익명 통계 실습"}]
 statistics_ui.get_learning_statistics = lambda practice_id, start, end: st.session_state.stats_data
+statistics_ui.get_question_answers = lambda practice_id, start, end: st.session_state.qa_data
 statistics_ui.render_statistics_dashboard()
 '''
 
@@ -53,11 +59,49 @@ class StatisticsServiceTest(unittest.TestCase):
         self.assertEqual(1, summary["types"]["기타"])
         self.assertIn("단정할 수는 없습니다", improvement_notes(summary)[0])
 
+    def test_privacy_keywords_kst_and_filters(self):
+        self.assertEqual(
+            "자료 2쪽을 확인하세요. 출처: 안전 수칙 안내서",
+            strip_internal_references("자료 2쪽을 확인하세요. 【4:0†source】 출처: 안전 수칙 안내서 file-AbCdEf123"),
+        )
+        self.assertEqual(
+            "이름 [삭제], 학번 [삭제], [이메일 삭제], [연락처 삭제]",
+            redact_personal_data("이름: 홍길동, 학번 20301, kid@example.com, 010-1234-5678"),
+        )
+        self.assertEqual(["톱", "절단"], validated_keywords(["톱", "톱", "절단", "kid@example.com"]))
+        event = question("safe", date="2026-11-20")
+        record = prepare_question_answer_record(
+            event, "제 이름은 홍길동이고 톱이 흔들려요", "홍길동 학생은 010-1234-5678로 연락하세요", ["톱", "홍길동"]
+        )
+        self.assertNotIn("홍길동", record["student_question"])
+        self.assertNotIn("010-1234-5678", record["ai_answer"])
+        self.assertNotIn("홍길동", record["ai_answer"])
+        self.assertEqual(["톱"], record["keywords"])
+        self.assertEqual("unreviewed", record["review_status"])
+        self.assertIsNone(record["retention_until"])
+        self.assertTrue(in_kst_period("2026-11-20T15:30:00+00:00", date(2026, 11, 21), date(2026, 11, 21)))
+        records = [
+            {**record, "stage_title": "조립", "question_type": "제작 방법", "has_image": True},
+            {**record, "event_id": "other", "stage_title": None, "question_type": "기타", "has_image": False, "student_question": "다른 질문"},
+        ]
+        self.assertEqual(1, len(filter_question_answers(records, "조립", "제작 방법", "사진 있음", "흔들")))
+        self.assertEqual(1, len(filter_question_answers(records, "미분류", "전체", "사진 없음", "")))
+
+    def test_tied_improvement_notes_include_all_leaders(self):
+        summary = aggregate_statistics({"sessions": [], "questions": [
+            question("one", stage_title="조립", step_title="접착"),
+            question("two", stage_title="검사", step_title="측정"),
+        ]})
+        notes = improvement_notes(summary)
+        self.assertIn("조립, 검사", notes[0])
+        self.assertIn("접착, 측정", notes[1])
+
 
 class StatisticsDashboardTest(unittest.TestCase):
     def test_empty_and_populated_dashboard(self):
         empty = AppTest.from_string(DASHBOARD_SOURCE)
         empty.session_state.stats_data = {"sessions": [], "questions": []}
+        empty.session_state.qa_data = []
         empty.run()
         self.assertTrue(any("수집된 익명 통계가 없습니다" in item.value for item in empty.info))
 
@@ -70,11 +114,22 @@ class StatisticsDashboardTest(unittest.TestCase):
                 step_title="길어도 전체 내용을 확인할 수 있어야 하는 세부 작업 이름",
             )],
         }
+        populated.session_state.qa_data = [{
+            "event_id": "q1", "practice_id": 1, "occurred_at": "2026-11-20T10:00:00+00:00",
+            "stage_title": "길어도 잘리지 않아야 하는 제작 단계 이름", "step_title": "조립",
+            "question_type": "제작 방법", "student_question": "어떻게 조립하나요?",
+            "ai_answer": "순서대로 조립하세요.", "keywords": ["조립"], "has_image": True,
+            "ai_response_success": True, "review_status": "unreviewed",
+        }]
         populated.run(timeout=15)
         self.assertEqual(4, len(populated.metric))
         headings = " ".join(item.value for item in populated.markdown)
         self.assertIn("제작 단계별 질문 수", headings)
         self.assertIn("날짜별 질문 수 추이", headings)
+        self.assertIn("질문 유형별 분포", headings)
+        self.assertIn("주요 질문 키워드", headings)
+        self.assertIn("학생 질문 및 AI 답변", headings)
+        self.assertEqual(["통계 대시보드", "질문·답변 관리"], [tab.label for tab in populated.tabs])
         self.assertTrue(any("실제 학생 수가 아니며" in item.value for item in populated.caption))
 
 
@@ -102,6 +157,13 @@ class SQLiteStatisticsTest(unittest.TestCase):
             self.assertEqual(1, data["questions"][0]["stage_plan_version"])
             stored_keys = set(data["questions"][0])
             self.assertFalse({"question", "answer", "email", "name", "image", "ip"} & stored_keys)
+            record = prepare_question_answer_record(first, "이름: 홍길동 어떻게 하나요?", "안전하게 하세요.", ["조립"])
+            self.assertTrue(sqlite_db.record_question_answer(record))
+            self.assertFalse(sqlite_db.record_question_answer(record))
+            saved = sqlite_db.get_question_answers(1, "2026-11-20", "2026-11-20")
+            self.assertEqual((1, ["조립"]), (len(saved), saved[0]["keywords"]))
+            unsafe = {**record, "event_id": "unsafe", "student_question": "kid@example.com"}
+            self.assertFalse(sqlite_db.record_question_answer(unsafe))
 
 
 class FirestoreStatisticsTest(unittest.TestCase):
@@ -121,9 +183,14 @@ class FirestoreStatisticsTest(unittest.TestCase):
             event = question("q1", has_image=True)
             self.assertTrue(firestore_db.record_learning_question(event))
             self.assertFalse(firestore_db.record_learning_question(event))
+            record = prepare_question_answer_record(event, "어떻게 만드나요?", "순서대로 하세요.", ["조립"])
+            self.assertTrue(firestore_db.record_question_answer(record))
+            self.assertFalse(firestore_db.record_question_answer(record))
             data = firestore_db.get_learning_statistics(1, "2026-11-20", "2026-11-20")
+            records = firestore_db.get_question_answers(1, "2026-11-20", "2026-11-20")
         self.assertEqual((1, 1), (len(data["sessions"]), len(data["questions"])))
         self.assertNotIn("question", data["questions"][0])
+        self.assertEqual("순서대로 하세요.", records[0]["ai_answer"])
 
 
 if __name__ == "__main__":

@@ -125,6 +125,13 @@ class SecureDatabaseTest(unittest.TestCase):
                  {"id": 3, "school_id": None},
              ]):
             self.assertEqual([1], [item["id"] for item in secure_database.list_practices()])
+        with patch.object(secure_database, "authorize", return_value=actor), \
+             patch.object(secure_database._database, "get_practice", return_value={
+                 "id": 2, "school_id": "school-b"
+             }), patch.object(secure_database._database, "get_question_answers") as records, \
+             self.assertRaises(AuthenticationError):
+            secure_database.get_question_answers(2, "2026-11-01", "2026-11-30")
+        records.assert_not_called()
         with patch.object(secure_database, "authorize", side_effect=AuthenticationError("revoked")), \
              self.assertRaises(AuthenticationError):
             secure_database.list_practices()

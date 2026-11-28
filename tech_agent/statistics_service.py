@@ -1,10 +1,26 @@
-"""Anonymous learning-event classification and aggregation."""
+"""Privacy-safe learning record helpers and statistics aggregation."""
 
 from collections import Counter
+from datetime import date, datetime, timezone
+import re
+from zoneinfo import ZoneInfo
 
 
 QUESTION_TYPES = (
     "제작 방법", "문제 원인 및 해결", "재료 및 도구", "원리 및 개념", "안전 관련", "기타",
+)
+KST = ZoneInfo("Asia/Seoul")
+REVIEW_STATUSES = {"unreviewed", "reviewed"}
+_EMAIL = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_PHONE = re.compile(r"(?<!\d)(?:01[016789][ -]?\d{3,4}[ -]?\d{4}|0\d{1,2}[ -]?\d{3,4}[ -]?\d{4})(?!\d)")
+_STUDENT_ID = re.compile(r"(?:학번|학생번호)\s*[:：]?\s*[A-Za-z0-9-]+")
+_NAME = re.compile(
+    r"(?:이름|성명|제\s*이름은)\s*[:：]?\s*(?P<name>[가-힣]{2,4})"
+    r"(?=\s|[,\.!?]|이고|입니다|이에요|예요|$)"
+)
+_STOPWORDS = {"안녕", "안녕하세요", "감사", "감사합니다", "그리고", "하지만", "그래서", "저는", "제가", "이것", "저것", "질문"}
+_INTERNAL_REFERENCE = re.compile(
+    r"(?:【\s*\d+\s*:\s*\d+\s*†[^】]*】|(?:file)?cite[^]*|\bfile[-_][A-Za-z0-9_-]{6,}\b)"
 )
 
 
@@ -18,6 +34,99 @@ def classify_question(text):
         ("제작 방법", ("방법", "어떻게", "순서", "만들", "조립", "자르", "붙이")),
     )
     return next((name for name, words in rules if any(word in text for word in words)), "기타")
+
+
+def kst_date(value):
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(KST).date()
+
+
+def in_kst_period(value, start_date, end_date):
+    day = kst_date(value)
+    return bool(day and date.fromisoformat(str(start_date)) <= day <= date.fromisoformat(str(end_date)))
+
+
+def redact_personal_data(text):
+    value = str(text or "").strip()
+    for pattern, replacement in (
+        (_EMAIL, "[이메일 삭제]"), (_PHONE, "[연락처 삭제]"),
+        (_STUDENT_ID, "학번 [삭제]"), (_NAME, "이름 [삭제]"),
+    ):
+        value = pattern.sub(replacement, value)
+    if any(pattern.search(value) for pattern in (_EMAIL, _PHONE, _STUDENT_ID, _NAME)):
+        return None
+    return value
+
+
+def strip_internal_references(text):
+    """Remove provider-only citation tokens while preserving ordinary source text."""
+    return re.sub(r"[ \t]+(?=\n)| {2,}", " ", _INTERNAL_REFERENCE.sub("", str(text or ""))).strip()
+
+
+def validated_keywords(keywords):
+    result = []
+    for keyword in keywords or []:
+        original = str(keyword).strip()
+        cleaned = redact_personal_data(original)
+        if not cleaned or cleaned != original or len(cleaned) > 30 or cleaned.lower() in _STOPWORDS:
+            continue
+        if cleaned not in result:
+            result.append(cleaned)
+    return result[:5]
+
+
+def prepare_question_answer_record(event, question, answer, keywords):
+    private_terms = {
+        match.group("name")
+        for text in (str(question or ""), str(answer or ""))
+        for match in _NAME.finditer(text)
+    }
+    safe_question = redact_personal_data(question)
+    safe_answer = redact_personal_data(strip_internal_references(answer))
+    if safe_question is None or safe_answer is None or not safe_question:
+        return None
+    for term in private_terms:
+        safe_question = safe_question.replace(term, "[이름 삭제]")
+        safe_answer = safe_answer.replace(term, "[이름 삭제]")
+    return {
+        "schema_version": 1,
+        "event_id": event["event_id"],
+        "practice_id": int(event["practice_id"]),
+        "occurred_at": event["occurred_at"],
+        "stage_index": event.get("stage_index"),
+        "stage_title": event.get("stage_title"),
+        "step_index": event.get("step_index"),
+        "step_title": event.get("step_title"),
+        "question_type": event.get("question_type", "기타"),
+        "student_question": safe_question,
+        "ai_answer": safe_answer,
+        "keywords": validated_keywords([
+            keyword for keyword in keywords or [] if str(keyword).strip() not in private_terms
+        ]),
+        "has_image": bool(event.get("has_image")),
+        "ai_response_success": bool(event.get("ai_response_success")),
+        "review_status": "unreviewed",
+        "retention_until": None,
+    }
+
+
+def is_safe_question_answer_record(record):
+    question = str(record.get("student_question", ""))
+    answer = str(record.get("ai_answer", ""))
+    return bool(
+        record.get("event_id") and question
+        and redact_personal_data(question) == question
+        and redact_personal_data(answer) == answer
+        and record.get("review_status", "unreviewed") in REVIEW_STATUSES
+    )
 
 
 def aggregate_statistics(data):
@@ -48,9 +157,34 @@ def aggregate_statistics(data):
             for item in questions
         ).most_common()),
     }
-    result["dates"] = dict(sorted(
-        Counter(str(item.get("occurred_at", ""))[:10] or "미분류" for item in questions).items()
-    ))
+    result["dates"] = dict(sorted(Counter(
+        day.isoformat() if (day := kst_date(item.get("occurred_at"))) else "미분류"
+        for item in questions
+    ).items()))
+    result["keywords"] = dict(Counter(
+        keyword for item in data.get("records", []) for keyword in item.get("keywords", [])
+    ).most_common())
+    result["keyword_question_count"] = len(data.get("records", []))
+    return result
+
+
+def filter_question_answers(records, stage="전체", question_type="전체", image="전체", search=""):
+    search = search.strip().lower()
+    result = []
+    for item in records:
+        if stage != "전체" and (item.get("stage_title") or "미분류") != stage:
+            continue
+        if question_type != "전체" and item.get("question_type") != question_type:
+            continue
+        if image != "전체" and bool(item.get("has_image")) != (image == "사진 있음"):
+            continue
+        haystack = " ".join((
+            item.get("student_question", ""), item.get("ai_answer", ""),
+            " ".join(item.get("keywords", [])),
+        )).lower()
+        if search and search not in haystack:
+            continue
+        result.append(item)
     return result
 
 
@@ -59,7 +193,10 @@ def improvement_notes(summary):
         return []
 
     def top(values):
-        return next(iter(values), "미분류")
+        if not values:
+            return "미분류"
+        maximum = max(values.values())
+        return ", ".join(label for label, count in values.items() if count == maximum)
 
     image_rate = summary["image_count"] / summary["question_count"] * 100
     return [

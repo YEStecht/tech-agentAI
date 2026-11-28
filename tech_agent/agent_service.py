@@ -5,7 +5,7 @@ import json
 import os
 
 from agents import Agent, FileSearchTool, Runner, SQLiteSession, set_default_openai_key
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 
 QUESTION_TYPES = {
@@ -20,6 +20,7 @@ class DiagnosisTurn(BaseModel):
     stage_conflict: bool = False
     stage_uncertain: bool = False
     question_type: str | None = None
+    keywords: list[str] = Field(default_factory=list)
 
 
 INSTRUCTIONS = """
@@ -60,7 +61,7 @@ INSTRUCTIONS = """
 한 번에 질문 하나만 하며, 이미 제공한 정보를 다시 요구하지 않는다.
 중학생이 이해하기 쉬운 친근하고 명확한 표현으로 기본 2~4개의 짧은 문장을 작성한다.
 필요한 안전 안내는 길이 제한보다 우선한다.
-answer에는 학생에게 보여 줄 답변만 작성한다. stage_index와 step_index는 0부터 시작하며 둘 다 확실할 때만 채운다. 충돌 또는 불확실 상태에서는 단계를 확정한 것처럼 말하지 않는다. question_type은 제작 방법, 문제 원인 및 해결, 재료 및 도구, 원리 및 개념, 안전 관련, 기타 중 하나를 사용한다.
+answer에는 학생에게 보여 줄 답변만 작성한다. stage_index와 step_index는 0부터 시작하며 둘 다 확실할 때만 채운다. 충돌 또는 불확실 상태에서는 단계를 확정한 것처럼 말하지 않는다. question_type은 제작 방법, 문제 원인 및 해결, 재료 및 도구, 원리 및 개념, 안전 관련, 기타 중 하나를 사용한다. keywords에는 학생 질문의 실습 관련 핵심어를 짧은 명사형으로 1~5개 작성한다. 이름, 학번, 연락처, 이메일은 포함하지 않는다. question_type과 keywords는 내부 기록용이며 answer에 노출하지 않는다.
 """
 
 
@@ -191,3 +192,8 @@ def resolve_stage(stages, turn, selected_stage=None, has_image=False):
 
 def validated_question_type(turn, fallback):
     return turn.question_type if turn.question_type in QUESTION_TYPES else fallback
+
+
+def validated_keywords(turn):
+    from statistics_service import validated_keywords as clean_keywords
+    return clean_keywords(getattr(turn, "keywords", []))
