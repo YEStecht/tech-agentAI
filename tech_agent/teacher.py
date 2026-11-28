@@ -75,7 +75,7 @@ init_db()
 
 with st.sidebar:
     st.header("🧑‍🏫 교사 메뉴")
-    menus = ["🧩 실습 관리", "📊 학습 통계"]
+    menus = ["🧩 실습 관리", "🙋 도움 요청 관리", "📊 학습 통계"]
     if actor["role"] == "admin":
         menus.append("👥 교사 권한 관리")
     menu = st.radio("이동할 메뉴", menus)
@@ -263,6 +263,11 @@ if menu == "🧩 실습 관리":
     st.divider()
     st.subheader("⑤ 실습 공개")
     render_publication_controls(selected_id)
+
+elif menu == "🙋 도움 요청 관리":
+    from help_request_ui import render_help_management
+
+    render_help_management(st.session_state.get("firebase_id_token"))
 
 elif menu == "📊 학습 통계":
     from statistics_ui import render_statistics_dashboard

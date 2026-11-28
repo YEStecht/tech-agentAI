@@ -98,7 +98,7 @@ def leave_practice():
         st.session_state.pop(key, None)
     for key in list(st.session_state):
         if key.startswith(("student_safety_check_", "selected_stage_", "selected_step_",
-                           "specify_stage_", "detected_stage_", "stage_conflict_")):
+                           "specify_stage_", "detected_stage_", "stage_conflict_", "help_")):
             del st.session_state[key]
 
 
@@ -396,6 +396,16 @@ with st.sidebar:
         if st.button("새 대화 시작", use_container_width=True):
             reset_conversation(practice_id)
             st.rerun()
+
+try:
+    from student_help_ui import render_student_help
+
+    render_student_help(
+        practice_id, st.session_state.learning_session_id, detected_stage
+    )
+except Exception:
+    logger.exception("교사 도움 요청 화면 처리 실패")
+    st.caption("교사 도움 요청 기능을 잠시 사용할 수 없어요. AI 상담은 계속할 수 있어요.")
 
 st.subheader("💬 AI에게 물어보기")
 

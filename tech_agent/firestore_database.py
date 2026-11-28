@@ -17,6 +17,10 @@ from guidance_service import (
     GuidanceConflictError, ReviewConflictError, normalized_review_status,
     safe_teacher_text, select_guidance, select_improvement_cases, validate_scope,
 )
+from help_request_service import (
+    clean_stage, new_code, normalize_code, utc_now, validate_seat,
+    validate_settings, validate_student_session,
+)
 
 PRACTICES = "practices"
 PRACTICE_FILES = "practice_files"
@@ -28,6 +32,12 @@ QUESTION_ANSWERS = "learning_question_answers"
 QUESTION_REVIEWS = "teacher_qa_reviews"
 GUIDANCE_INSTRUCTIONS = "practice_guidance_instructions"
 MATERIAL_PAGES = "practice_material_pages"
+HELP_SETTINGS = "practice_help_settings"
+HELP_SESSIONS = "help_class_sessions"
+HELP_REQUESTS = "teacher_help_requests"
+HELP_LOCKS = "teacher_help_request_locks"
+HELP_STUDENT_STATES = "teacher_help_student_states"
+HELP_CODES = "teacher_help_codes"
 __all__ = [
     "get_connection", "init_db", "create_practice", "list_practices", "get_practice",
     "update_practice", "set_vector_store", "list_practice_files", "delete_practice",
@@ -44,6 +54,10 @@ __all__ = [
     "delete_guidance_instruction", "get_active_guidance_instructions",
     "get_relevant_improvement_cases",
     "save_material_pages", "get_student_material_catalog", "get_student_material_page",
+    "get_help_settings", "save_help_settings", "start_help_session", "end_help_session",
+    "get_active_help_session", "join_help_session", "list_pending_help_requests",
+    "create_help_request", "get_student_help_request", "cancel_help_request",
+    "complete_help_request", "get_help_session", "has_active_help_session",
 ]
 
 
@@ -298,6 +312,287 @@ def get_student_material_page(practice_id, file_id, page_number):
         return None
     return {**snapshot.to_dict(), "filename": file["filename"],
             "visual_source_filename": file.get("visual_source_filename")}
+
+
+def _help_settings_ref(client, practice_id, teacher_uid):
+    return client.collection(HELP_SETTINGS).document(f"{practice_id}:{teacher_uid}")
+
+
+def get_help_settings(practice_id, teacher_uid):
+    snapshot = _help_settings_ref(get_firestore_client(), practice_id, teacher_uid).get()
+    return ({"practice_id": int(practice_id), **snapshot.to_dict()} if snapshot.exists else {
+        "practice_id": int(practice_id), "teacher_uid": teacher_uid,
+        "enabled": False, "class_label": "",
+        "group_count": 1, "max_seats": 1, "active_session_id": None,
+    })
+
+
+def save_help_settings(practice_id, teacher_uid, enabled, class_label, group_count, max_seats):
+    label, groups, seats = validate_settings(class_label, group_count, max_seats)
+    client = get_firestore_client()
+    settings_ref = _help_settings_ref(client, practice_id, teacher_uid)
+    now = utc_now()
+
+    def operation(transaction):
+        if not client.collection(PRACTICES).document(str(practice_id)).get(transaction=transaction).exists:
+            raise ValueError("등록된 실습을 찾을 수 없습니다.")
+        current = settings_ref.get(transaction=transaction)
+        active_id = current.to_dict().get("active_session_id") if current.exists else None
+        if not enabled and active_id:
+            _end_help_session_transaction(client, transaction, active_id, now)
+            active_id = None
+        transaction.set(settings_ref, {
+            "practice_id": int(practice_id), "teacher_uid": teacher_uid,
+            "enabled": bool(enabled), "class_label": label,
+            "group_count": groups, "max_seats": seats, "active_session_id": active_id,
+            "updated_at": now,
+        })
+    _run_transaction(client, operation)
+    return get_help_settings(practice_id, teacher_uid)
+
+
+def _end_help_session_transaction(client, transaction, session_id, now):
+    session_ref = client.collection(HELP_SESSIONS).document(session_id)
+    snapshot = session_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return False
+    requests = list(client.collection(HELP_REQUESTS).where(
+        "status_session", "==", f"{session_id}:waiting"
+    ).stream(transaction=transaction))
+    transaction.set(session_ref, {
+        "active": False, "active_practice": None, "ended_at": now,
+    }, merge=True)
+    for item in requests:
+        transaction.set(client.collection(HELP_REQUESTS).document(item.id), {
+            "status": "cancelled", "status_session": f"{session_id}:cancelled",
+            "resolved_at": now,
+        }, merge=True)
+        data = item.to_dict()
+        transaction.delete(client.collection(HELP_LOCKS).document(
+            f"seat:{session_id}:{data['group_number']}:{data['seat_number']}"
+        ))
+        transaction.delete(client.collection(HELP_LOCKS).document(
+            f"student:{session_id}:{data['student_session_id']}"
+        ))
+        transaction.set(client.collection(HELP_STUDENT_STATES).document(
+            f"{session_id}:{data['student_session_id']}"
+        ), {"id": item.id, "class_session_id": session_id,
+            "student_session_id": data["student_session_id"], "status": "cancelled"})
+    return True
+
+
+def start_help_session(practice_id, teacher_uid, teacher_email, school_id):
+    client = get_firestore_client()
+    session_id = uuid.uuid4().hex
+    now = utc_now()
+    for _ in range(20):
+        code = new_code()
+        code_ref = client.collection(HELP_CODES).document(code)
+        if not code_ref.get().exists:
+            break
+    else:
+        raise RuntimeError("수업 코드를 만들지 못했습니다. 다시 시도해 주세요.")
+
+    def operation(transaction):
+        practice = client.collection(PRACTICES).document(str(practice_id)).get(transaction=transaction)
+        settings_ref = _help_settings_ref(client, practice_id, teacher_uid)
+        settings = settings_ref.get(transaction=transaction)
+        if not practice.exists or not practice.to_dict().get("is_published"):
+            raise ValueError("공개된 실습에서만 수업을 시작할 수 있습니다.")
+        if not settings.exists or not settings.to_dict().get("enabled"):
+            raise ValueError("도움 요청 기능을 먼저 활성화해 주세요.")
+        values = settings.to_dict()
+        if code_ref.get(transaction=transaction).exists:
+            raise RuntimeError("수업 코드가 중복되었습니다. 다시 시도해 주세요.")
+        if values.get("active_session_id"):
+            _end_help_session_transaction(client, transaction, values["active_session_id"], now)
+        session = {
+            "id": session_id, "practice_id": int(practice_id), "school_id": school_id,
+            "teacher_uid": teacher_uid, "teacher_email": teacher_email,
+            "class_label": values["class_label"], "join_code": code,
+            "group_count": int(values["group_count"]), "max_seats": int(values["max_seats"]),
+            "active": True, "active_practice": f"{practice_id}:active",
+            "started_at": now, "ended_at": None,
+        }
+        transaction.set(client.collection(HELP_SESSIONS).document(session_id), session)
+        transaction.set(code_ref, {"session_id": session_id})
+        transaction.set(settings_ref, {"active_session_id": session_id}, merge=True)
+    _run_transaction(client, operation)
+    return get_help_session(session_id)
+
+
+def get_help_session(session_id):
+    snapshot = get_firestore_client().collection(HELP_SESSIONS).document(str(session_id)).get()
+    return snapshot.to_dict() if snapshot.exists else None
+
+
+def get_active_help_session(practice_id, teacher_uid=None):
+    if teacher_uid is None:
+        snapshots = get_firestore_client().collection(HELP_SESSIONS).where(
+            "active_practice", "==", f"{practice_id}:active"
+        ).stream()
+        return next((item.to_dict() for item in snapshots), None)
+    settings = get_help_settings(practice_id, teacher_uid)
+    session = get_help_session(settings.get("active_session_id")) if settings.get("active_session_id") else None
+    return session if session and session.get("active") else None
+
+
+def has_active_help_session(practice_id):
+    session = get_active_help_session(practice_id)
+    practice = get_practice(practice_id)
+    return bool(
+        session and practice and practice.get("is_published")
+        and get_help_settings(practice_id, session["teacher_uid"]).get("enabled")
+    )
+
+
+def end_help_session(session_id):
+    client = get_firestore_client()
+    now = utc_now()
+
+    def operation(transaction):
+        session_ref = client.collection(HELP_SESSIONS).document(str(session_id))
+        snapshot = session_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return False
+        practice_id = snapshot.to_dict()["practice_id"]
+        settings_ref = _help_settings_ref(client, practice_id, snapshot.to_dict()["teacher_uid"])
+        settings = settings_ref.get(transaction=transaction)
+        _end_help_session_transaction(client, transaction, str(session_id), now)
+        if settings.exists and settings.to_dict().get("active_session_id") == session_id:
+            transaction.set(settings_ref, {"active_session_id": None}, merge=True)
+        return True
+    return _run_transaction(client, operation)
+
+
+def join_help_session(practice_id, join_code):
+    code = normalize_code(join_code)
+    if len(code) != 6:
+        return None
+    client = get_firestore_client()
+    code_snapshot = client.collection(HELP_CODES).document(code).get()
+    if not code_snapshot.exists:
+        return None
+    session = get_help_session(code_snapshot.to_dict().get("session_id"))
+    practice = get_practice(practice_id)
+    settings = get_help_settings(practice_id, session.get("teacher_uid") if session else "")
+    if not session or int(session.get("practice_id", -1)) != int(practice_id) \
+            or not session.get("active") or not practice or not practice.get("is_published") \
+            or not settings.get("enabled"):
+        return None
+    return session
+
+
+def create_help_request(session_id, practice_id, student_session_id, group_number, seat_number,
+                        stage=None):
+    student_session_id = validate_student_session(student_session_id)
+    client = get_firestore_client()
+    request_id = uuid.uuid4().hex
+    now = utc_now()
+
+    def operation(transaction):
+        session_ref = client.collection(HELP_SESSIONS).document(str(session_id))
+        session_snapshot = session_ref.get(transaction=transaction)
+        settings = _help_settings_ref(
+            client, practice_id, session_snapshot.to_dict().get("teacher_uid") if session_snapshot.exists else ""
+        ).get(transaction=transaction)
+        practice = client.collection(PRACTICES).document(str(practice_id)).get(transaction=transaction)
+        if not session_snapshot.exists or int(session_snapshot.to_dict().get("practice_id", -1)) != int(practice_id) \
+                or not session_snapshot.to_dict().get("active") or not settings.exists \
+                or not settings.to_dict().get("enabled") or not practice.exists \
+                or not practice.to_dict().get("is_published"):
+            raise ValueError("수업이 종료되었거나 도움 요청을 받을 수 없습니다.")
+        session = session_snapshot.to_dict()
+        group, seat = validate_seat(session, group_number, seat_number)
+        student_lock = client.collection(HELP_LOCKS).document(f"student:{session_id}:{student_session_id}")
+        seat_lock = client.collection(HELP_LOCKS).document(f"seat:{session_id}:{group}:{seat}")
+        if student_lock.get(transaction=transaction).exists or seat_lock.get(transaction=transaction).exists:
+            raise ValueError("이미 대기 중인 도움 요청이 있습니다.")
+        safe_stage = clean_stage(stage)
+        request = {
+            "id": request_id, "class_session_id": session_id, "practice_id": int(practice_id),
+            "student_session_id": student_session_id, "group_number": group, "seat_number": seat,
+            "stage_index": safe_stage["stage_index"], "stage_title": safe_stage["stage_title"],
+            "step_index": safe_stage["step_index"], "step_title": safe_stage["step_title"],
+            "requested_at": now,
+            "status": "waiting", "status_session": f"{session_id}:waiting", "resolved_at": None,
+        }
+        transaction.set(client.collection(HELP_REQUESTS).document(request_id), request)
+        transaction.set(student_lock, {"request_id": request_id})
+        transaction.set(seat_lock, {"request_id": request_id})
+        transaction.set(client.collection(HELP_STUDENT_STATES).document(
+            f"{session_id}:{student_session_id}"
+        ), {"id": request_id, "class_session_id": session_id,
+            "student_session_id": student_session_id, "status": "waiting"})
+    _run_transaction(client, operation)
+    return get_student_help_request(session_id, student_session_id)
+
+
+def get_student_help_request(session_id, student_session_id):
+    student_session_id = validate_student_session(student_session_id)
+    client = get_firestore_client()
+    state = client.collection(HELP_STUDENT_STATES).document(f"{session_id}:{student_session_id}").get()
+    value = state.to_dict() if state.exists else None
+    return value if value and value.get("student_session_id") == student_session_id else None
+
+
+def cancel_help_request(request_id, session_id, student_session_id):
+    student_session_id = validate_student_session(student_session_id)
+    client = get_firestore_client()
+
+    def operation(transaction):
+        reference = client.collection(HELP_REQUESTS).document(str(request_id))
+        snapshot = reference.get(transaction=transaction)
+        if not snapshot.exists:
+            return False
+        value = snapshot.to_dict()
+        if value.get("class_session_id") != session_id \
+                or value.get("student_session_id") != student_session_id \
+                or value.get("status") != "waiting":
+            return False
+        transaction.set(reference, {"status": "cancelled", "status_session": f"{session_id}:cancelled",
+                                    "resolved_at": utc_now()}, merge=True)
+        transaction.delete(client.collection(HELP_LOCKS).document(f"student:{session_id}:{student_session_id}"))
+        transaction.delete(client.collection(HELP_LOCKS).document(
+            f"seat:{session_id}:{value['group_number']}:{value['seat_number']}"))
+        transaction.set(client.collection(HELP_STUDENT_STATES).document(
+            f"{session_id}:{student_session_id}"
+        ), {"id": request_id, "class_session_id": session_id,
+            "student_session_id": student_session_id, "status": "cancelled"})
+        return True
+    return _run_transaction(client, operation)
+
+
+def list_pending_help_requests(session_id):
+    snapshots = get_firestore_client().collection(HELP_REQUESTS).where(
+        "status_session", "==", f"{session_id}:waiting"
+    ).stream()
+    return sorted((item.to_dict() for item in snapshots), key=lambda value: value["requested_at"])
+
+
+def complete_help_request(request_id, session_id):
+    client = get_firestore_client()
+
+    def operation(transaction):
+        reference = client.collection(HELP_REQUESTS).document(str(request_id))
+        snapshot = reference.get(transaction=transaction)
+        if not snapshot.exists:
+            return False
+        value = snapshot.to_dict()
+        if value.get("class_session_id") != session_id or value.get("status") != "waiting":
+            return False
+        transaction.set(reference, {"status": "completed", "status_session": f"{session_id}:completed",
+                                    "resolved_at": utc_now()}, merge=True)
+        transaction.delete(client.collection(HELP_LOCKS).document(
+            f"student:{session_id}:{value['student_session_id']}"))
+        transaction.delete(client.collection(HELP_LOCKS).document(
+            f"seat:{session_id}:{value['group_number']}:{value['seat_number']}"))
+        transaction.set(client.collection(HELP_STUDENT_STATES).document(
+            f"{session_id}:{value['student_session_id']}"
+        ), {"id": request_id, "class_session_id": session_id,
+            "student_session_id": value["student_session_id"], "status": "completed"})
+        return True
+    return _run_transaction(client, operation)
 
 
 def _stage_plan_ref(client, practice_id):

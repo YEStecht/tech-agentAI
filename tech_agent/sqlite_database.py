@@ -17,6 +17,10 @@ from guidance_service import (
     GuidanceConflictError, ReviewConflictError, normalized_review_status,
     safe_teacher_text, select_guidance, select_improvement_cases, validate_scope,
 )
+from help_request_service import (
+    clean_stage, new_code, normalize_code, utc_now, validate_seat,
+    validate_settings, validate_student_session,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("PRACTICE_DB_PATH", str(BASE_DIR / "practice_data.db")))
@@ -36,6 +40,10 @@ __all__ = [
     "delete_guidance_instruction", "get_active_guidance_instructions",
     "get_relevant_improvement_cases",
     "save_material_pages", "get_student_material_catalog", "get_student_material_page",
+    "get_help_settings", "save_help_settings", "start_help_session", "end_help_session",
+    "get_active_help_session", "join_help_session", "list_pending_help_requests",
+    "create_help_request", "get_student_help_request", "cancel_help_request",
+    "complete_help_request", "get_help_session", "has_active_help_session",
 ]
 
 
@@ -215,6 +223,58 @@ def init_db():
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS practice_help_settings (
+                practice_id INTEGER NOT NULL,
+                teacher_uid TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                class_label TEXT NOT NULL,
+                group_count INTEGER NOT NULL,
+                max_seats INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (practice_id, teacher_uid),
+                FOREIGN KEY (practice_id) REFERENCES practices(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS help_class_sessions (
+                id TEXT PRIMARY KEY,
+                practice_id INTEGER NOT NULL,
+                school_id TEXT,
+                teacher_uid TEXT NOT NULL,
+                teacher_email TEXT NOT NULL,
+                class_label TEXT NOT NULL,
+                join_code TEXT NOT NULL UNIQUE,
+                group_count INTEGER NOT NULL,
+                max_seats INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                FOREIGN KEY (practice_id) REFERENCES practices(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS teacher_help_requests (
+                id TEXT PRIMARY KEY,
+                class_session_id TEXT NOT NULL,
+                practice_id INTEGER NOT NULL,
+                student_session_id TEXT NOT NULL,
+                group_number INTEGER NOT NULL,
+                seat_number INTEGER NOT NULL,
+                stage_index INTEGER,
+                stage_title TEXT,
+                step_index INTEGER,
+                step_title TEXT,
+                requested_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                resolved_at TEXT,
+                FOREIGN KEY (class_session_id) REFERENCES help_class_sessions(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS help_waiting_student ON teacher_help_requests "
+                     "(class_session_id, student_session_id) WHERE status = 'waiting'")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS help_waiting_seat ON teacher_help_requests "
+                     "(class_session_id, group_number, seat_number) WHERE status = 'waiting'")
 
 
 def create_practice(title, description="", school_id=None):
@@ -348,6 +408,212 @@ def get_student_material_page(practice_id, file_id, page_number):
             (int(practice_id), int(file_id), int(page_number)),
         ).fetchone()
     return dict(row) if row else None
+
+
+def get_help_settings(practice_id, teacher_uid):
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM practice_help_settings WHERE practice_id = ? AND teacher_uid = ?",
+            (int(practice_id), teacher_uid),
+        ).fetchone()
+    return dict(row) if row else {
+        "practice_id": int(practice_id), "teacher_uid": teacher_uid, "enabled": 0, "class_label": "",
+        "group_count": 1, "max_seats": 1,
+    }
+
+
+def save_help_settings(practice_id, teacher_uid, enabled, class_label, group_count, max_seats):
+    label, groups, seats = validate_settings(class_label, group_count, max_seats)
+    now = utc_now()
+    with closing(get_connection()) as conn, conn:
+        if not conn.execute("SELECT 1 FROM practices WHERE id = ?", (practice_id,)).fetchone():
+            raise ValueError("등록된 실습을 찾을 수 없습니다.")
+        conn.execute(
+            "INSERT INTO practice_help_settings "
+            "(practice_id, teacher_uid, enabled, class_label, group_count, max_seats, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(practice_id, teacher_uid) DO UPDATE SET "
+            "enabled=excluded.enabled, class_label=excluded.class_label, "
+            "group_count=excluded.group_count, max_seats=excluded.max_seats, "
+            "updated_at=excluded.updated_at",
+            (practice_id, teacher_uid, int(bool(enabled)), label, groups, seats, now),
+        )
+        if not enabled:
+            _end_help_sessions(conn, practice_id, now, teacher_uid)
+    return get_help_settings(practice_id, teacher_uid)
+
+
+def _end_help_sessions(conn, practice_id, now, teacher_uid=None):
+    teacher_clause = " AND teacher_uid = ?" if teacher_uid else ""
+    params = (practice_id, teacher_uid) if teacher_uid else (practice_id,)
+    session_ids = [row[0] for row in conn.execute(
+        "SELECT id FROM help_class_sessions WHERE practice_id = ? AND active = 1" + teacher_clause,
+        params,
+    )]
+    conn.execute(
+        "UPDATE help_class_sessions SET active = 0, ended_at = ? "
+        "WHERE practice_id = ? AND active = 1" + teacher_clause, (now, *params),
+    )
+    if session_ids:
+        placeholders = ",".join("?" for _ in session_ids)
+        conn.execute(
+            f"UPDATE teacher_help_requests SET status = 'cancelled', resolved_at = ? "
+            f"WHERE status = 'waiting' AND class_session_id IN ({placeholders})",
+            (now, *session_ids),
+        )
+
+
+def start_help_session(practice_id, teacher_uid, teacher_email, school_id):
+    settings = get_help_settings(practice_id, teacher_uid)
+    if not settings.get("enabled"):
+        raise ValueError("도움 요청 기능을 먼저 활성화해 주세요.")
+    now = utc_now()
+    session_id = uuid.uuid4().hex
+    with closing(get_connection()) as conn, conn:
+        practice = conn.execute("SELECT * FROM practices WHERE id = ?", (practice_id,)).fetchone()
+        if not practice or not practice["is_published"]:
+            raise ValueError("공개된 실습에서만 수업을 시작할 수 있습니다.")
+        _end_help_sessions(conn, practice_id, now, teacher_uid)
+        for _ in range(20):
+            code = new_code()
+            if not conn.execute("SELECT 1 FROM help_class_sessions WHERE join_code = ?", (code,)).fetchone():
+                break
+        else:
+            raise RuntimeError("수업 코드를 만들지 못했습니다. 다시 시도해 주세요.")
+        conn.execute(
+            "INSERT INTO help_class_sessions "
+            "(id, practice_id, school_id, teacher_uid, teacher_email, class_label, join_code, "
+            "group_count, max_seats, active, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (session_id, practice_id, school_id, teacher_uid, teacher_email,
+             settings["class_label"], code, settings["group_count"], settings["max_seats"], now),
+        )
+    return get_help_session(session_id)
+
+
+def get_help_session(session_id):
+    with closing(get_connection()) as conn:
+        row = conn.execute("SELECT * FROM help_class_sessions WHERE id = ?", (session_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_active_help_session(practice_id, teacher_uid=None):
+    teacher_clause = " AND teacher_uid = ?" if teacher_uid else ""
+    params = (int(practice_id), teacher_uid) if teacher_uid else (int(practice_id),)
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM help_class_sessions WHERE practice_id = ? AND active = 1" + teacher_clause +
+            " ORDER BY started_at DESC LIMIT 1", params,
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def has_active_help_session(practice_id):
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM help_class_sessions s JOIN practices p ON p.id=s.practice_id "
+            "JOIN practice_help_settings h ON h.practice_id=s.practice_id AND h.teacher_uid=s.teacher_uid "
+            "WHERE s.practice_id=? AND s.active=1 AND p.is_published=1 AND h.enabled=1 LIMIT 1",
+            (int(practice_id),),
+        ).fetchone()
+    return row is not None
+
+
+def end_help_session(session_id):
+    now = utc_now()
+    with closing(get_connection()) as conn, conn:
+        session = conn.execute("SELECT * FROM help_class_sessions WHERE id = ?", (session_id,)).fetchone()
+        if not session:
+            return False
+        conn.execute("UPDATE help_class_sessions SET active = 0, ended_at = ? WHERE id = ?",
+                     (now, session_id))
+        conn.execute("UPDATE teacher_help_requests SET status = 'cancelled', resolved_at = ? "
+                     "WHERE class_session_id = ? AND status = 'waiting'", (now, session_id))
+    return True
+
+
+def join_help_session(practice_id, join_code):
+    code = normalize_code(join_code)
+    if len(code) != 6:
+        return None
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT s.* FROM help_class_sessions s JOIN practices p ON p.id = s.practice_id "
+            "JOIN practice_help_settings h ON h.practice_id = s.practice_id AND h.teacher_uid=s.teacher_uid "
+            "WHERE s.practice_id = ? AND s.join_code = ? AND s.active = 1 "
+            "AND p.is_published = 1 AND h.enabled = 1", (int(practice_id), code),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_help_request(session_id, practice_id, student_session_id, group_number, seat_number,
+                        stage=None):
+    student_session_id = validate_student_session(student_session_id)
+    now = utc_now()
+    request_id = uuid.uuid4().hex
+    with closing(get_connection()) as conn, conn:
+        session = conn.execute(
+            "SELECT s.* FROM help_class_sessions s JOIN practices p ON p.id=s.practice_id "
+            "JOIN practice_help_settings h ON h.practice_id=s.practice_id AND h.teacher_uid=s.teacher_uid "
+            "WHERE s.id=? AND s.practice_id=? AND s.active=1 AND p.is_published=1 AND h.enabled=1",
+            (session_id, int(practice_id)),
+        ).fetchone()
+        if not session:
+            raise ValueError("수업이 종료되었거나 도움 요청을 받을 수 없습니다.")
+        group, seat = validate_seat(dict(session), group_number, seat_number)
+        stage = clean_stage(stage)
+        try:
+            conn.execute(
+                "INSERT INTO teacher_help_requests "
+                "(id, class_session_id, practice_id, student_session_id, group_number, seat_number, "
+                "stage_index, stage_title, step_index, step_title, requested_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting')",
+                (request_id, session_id, practice_id, student_session_id, group, seat,
+                 stage["stage_index"], stage["stage_title"],
+                 stage["step_index"], stage["step_title"], now),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("이미 대기 중인 도움 요청이 있습니다.") from exc
+    return get_student_help_request(session_id, student_session_id)
+
+
+def get_student_help_request(session_id, student_session_id):
+    student_session_id = validate_student_session(student_session_id)
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM teacher_help_requests WHERE class_session_id = ? "
+            "AND student_session_id = ? ORDER BY requested_at DESC LIMIT 1",
+            (session_id, student_session_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def cancel_help_request(request_id, session_id, student_session_id):
+    student_session_id = validate_student_session(student_session_id)
+    with closing(get_connection()) as conn, conn:
+        cursor = conn.execute(
+            "UPDATE teacher_help_requests SET status='cancelled', resolved_at=? "
+            "WHERE id=? AND class_session_id=? AND student_session_id=? AND status='waiting'",
+            (utc_now(), request_id, session_id, student_session_id),
+        )
+    return cursor.rowcount > 0
+
+
+def list_pending_help_requests(session_id):
+    with closing(get_connection()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM teacher_help_requests WHERE class_session_id=? AND status='waiting' "
+            "ORDER BY requested_at ASC", (session_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def complete_help_request(request_id, session_id):
+    with closing(get_connection()) as conn, conn:
+        cursor = conn.execute(
+            "UPDATE teacher_help_requests SET status='completed', resolved_at=? "
+            "WHERE id=? AND class_session_id=? AND status='waiting'",
+            (utc_now(), request_id, session_id),
+        )
+    return cursor.rowcount > 0
 
 
 def get_stage_plan(practice_id):

@@ -36,6 +36,8 @@ st.session_state.setdefault("test_qa_records", {})
 st.session_state.setdefault("test_stat_failure", False)
 st.session_state.setdefault("test_guidance_failure", False)
 st.session_state.setdefault("test_material_failure", False)
+st.session_state.setdefault("test_help_active", False)
+st.session_state.setdefault("test_help_status", None)
 
 PRACTICES = {
     1: {"id": 1, "title": "공개 실습 A", "description": "설명 A", "is_published": 1, "vector_store_id": "vs_1"},
@@ -134,6 +136,26 @@ def get_material_page(practice_id, file_id, page_number):
         "visual_source_filename": "guide.pdf", "page_number": page_number,
     } if practice_id == 1 and file_id == 7 and page_number == 2 else None)
 database.get_student_material_page = get_material_page
+HELP_SESSION = {"id": "class-1", "practice_id": 1, "class_label": "1반", "join_code": "ABC123",
+                "group_count": 2, "max_seats": 3, "active": True}
+database.has_active_help_session = lambda practice_id: st.session_state.test_help_active
+database.join_help_session = lambda practice_id, code: HELP_SESSION if code == "ABC123" and st.session_state.test_help_active else None
+database.get_help_session = lambda session_id: ({**HELP_SESSION, "active": st.session_state.test_help_active}
+                                                if session_id == "class-1" else None)
+def get_help_request(session_id, student_session_id):
+    status = st.session_state.test_help_status
+    return ({"id": "request-1", "class_session_id": session_id,
+             "student_session_id": student_session_id, "status": status} if status else None)
+database.get_student_help_request = get_help_request
+def create_help(*args, **kwargs):
+    st.session_state.test_help_status = "waiting"
+    st.session_state.test_help_create_calls = st.session_state.get("test_help_create_calls", 0) + 1
+    return get_help_request(args[0], args[2])
+database.create_help_request = create_help
+def cancel_help(*args, **kwargs):
+    st.session_state.test_help_status = "cancelled"
+    return True
+database.cancel_help_request = cancel_help
 agents.SQLiteSession = FakeSession
 agent_service.create_agent = lambda vector_store_id: st.session_state.__setitem__("test_vector_store", vector_store_id) or object()
 def ask_agent(agent, question, stages, session, image=None, image_mime_type=None, selected_stage=None, guidance=None, material_catalog=None):
@@ -546,6 +568,24 @@ class StudentAppTest(unittest.TestCase):
         app.chat_input[0].set_value("어떻게 조립하나요?").run()
         self.assertTrue(any("모의 답변" in item.value for item in app.markdown))
         self.assertFalse(any("관련 실습 자료 보기" in item.label for item in app.expander))
+
+    def test_help_request_flow_preserves_chat_and_does_not_call_ai(self):
+        app = AppTest.from_string(APP_SOURCE).run(timeout=10)
+        self._button(app, "start_practice_1").click().run()
+        self._complete_safety(app)
+        app.session_state.test_help_active = True
+        app.run(timeout=10)
+        self.assertTrue(any("선생님 도움이 필요해" in item.value for item in app.markdown))
+        next(item for item in app.text_input if item.label == "수업 코드").set_value("ABC123")
+        self._button_label(app, "코드 확인").click().run(timeout=10)
+        next(item for item in app.selectbox if item.label == "모둠 번호").select(2)
+        next(item for item in app.selectbox if item.label == "좌석 번호").select(3)
+        self._button_label(app, "수업 참여").click().run(timeout=10)
+        self._button_label(app, "선생님 도움 요청").click().run(timeout=10)
+        self.assertEqual("waiting", app.session_state.test_help_status)
+        self.assertEqual(1, app.session_state.test_help_create_calls)
+        self.assertEqual([], app.session_state.messages)
+        self.assertNotIn("test_agent_call", app.session_state)
 
 
 if __name__ == "__main__":
